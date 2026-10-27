@@ -151,32 +151,38 @@ test("a retry shows visible status while waiting", async () => {
 	await pending;
 });
 
-test("a retried request drops replay ids so another node can accept it", async () => {
+/** Registers the extension and runs one settle for `error`. */
+async function settleWith(error, settings = {}) {
 	const handlers = new Map();
 	const pi = {
 		on: (name, handler) => handlers.set(name, handler),
-		getSettings: () => ({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } }),
+		getSettings: () => ({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, ...settings } }),
 	};
 	register(pi);
 	const ctx = { hasUI: false, signal: undefined, ui: { notify() {}, setStatus() {}, setWorkingMessage() {} } };
 	handlers.get("session_start")({}, ctx);
 	await handlers.get("agent_before_settle")(
-		{
-			outcome: "error",
-			entries: [],
-			context: { contextMessages: [{ role: "assistant", stopReason: "error", errorMessage: "400: different resource" }] },
-		},
+		{ outcome: "error", entries: [], context: { contextMessages: [{ role: "assistant", stopReason: "error", errorMessage: error }] } },
 		ctx,
 	);
-	const payload = {
-		model: "m",
-		input: [
-			{ type: "message", role: "user", id: "msg_abc", content: [{ type: "input_text", text: "hi" }] },
-			{ type: "reasoning", id: "rs_xyz", encrypted_content: "keep-me", summary: [] },
-			{ type: "function_call", id: "fc_1", call_id: "call_1", name: "read", arguments: "{}" },
-			{ type: "function_call_output", id: "fco_1", call_id: "call_1", output: "ok" },
-		],
-	};
+	return handlers;
+}
+
+const historyPayload = () => ({
+	model: "m",
+	input: [
+		{ type: "message", role: "user", id: "msg_abc", content: [{ type: "input_text", text: "hi" }] },
+		{ type: "reasoning", id: "rs_xyz", encrypted_content: "keep-me", summary: [] },
+		{ type: "function_call", id: "fc_1", call_id: "call_1", name: "read", arguments: "{}" },
+		{ type: "function_call_output", id: "fco_1", call_id: "call_1", output: "ok" },
+	],
+});
+
+test("a retried request drops replay ids when the session ids are dead", async () => {
+	const handlers = await settleWith(
+		'400: {"message":"The requested item was created under a different Azure OpenAI resource.","type":"invalid_request_error"}',
+	);
+	const payload = historyPayload();
 	const repaired = handlers.get("before_provider_request")({ type: "before_provider_request", payload });
 	assert.deepEqual(
 		repaired.input.map(i => i.id),
@@ -186,6 +192,39 @@ test("a retried request drops replay ids so another node can accept it", async (
 	assert.equal(repaired.input[1].encrypted_content, "keep-me");
 	assert.equal(repaired.input[2].call_id, "call_1");
 	assert.deepEqual(repaired.input[0].content, [{ type: "input_text", text: "hi" }]);
+});
+
+test("an ordinary retry keeps the history byte-identical", async () => {
+	const handlers = await settleWith("503: upstream temporarily unavailable");
+	const payload = historyPayload();
+	const out = handlers.get("before_provider_request")({ type: "before_provider_request", payload });
+	assert.equal(out, undefined, "history must not be stripped for a plain transient error");
+});
+
+test("a generic 400 does not strip history", async () => {
+	const handlers = await settleWith("400: bad request, invalid model name");
+	const payload = historyPayload();
+	assert.equal(handlers.get("before_provider_request")({ type: "before_provider_request", payload }), undefined);
+});
+
+test("the account-mismatch wording also strips history", async () => {
+	const handlers = await settleWith("The replayed conversation state belongs to a different upstream account. Start a new conversation and retry.");
+	assert.notEqual(handlers.get("before_provider_request")({ type: "before_provider_request", payload: historyPayload() }), undefined);
+});
+
+test("repairHistory: false never strips, even for a dead session", async () => {
+	const handlers = await settleWith("400: created under a different Azure OpenAI resource", { repairHistory: false });
+	assert.equal(handlers.get("before_provider_request")({ type: "before_provider_request", payload: historyPayload() }), undefined);
+});
+
+test("only one request is repaired per retry", async () => {
+	const handlers = await settleWith("400: created under a different Azure OpenAI resource");
+	handlers.get("before_provider_request")({ type: "before_provider_request", payload: historyPayload() });
+	assert.equal(
+		handlers.get("before_provider_request")({ type: "before_provider_request", payload: historyPayload() }),
+		undefined,
+		"a second request must keep its history",
+	);
 });
 
 test("ordinary requests are never repaired", async () => {

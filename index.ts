@@ -19,16 +19,17 @@ type RetryConfig = {
 	/** Also retry errors Pi classifies as quota/billing (it never retries those). */
 	retryQuotaErrors: boolean;
 	/**
-	 * Drop replay-only item ids on retries. A relay may answer with a resource that cannot
-	 * resolve ids minted by the previous node; without this the same history keeps failing.
+	 * Allow dropping replay-only item ids, but only after the upstream explicitly reports that
+	 * the session's items belong to a resource this node cannot resolve. Ordinary retries keep
+	 * the history intact so the model keeps its memory.
 	 */
 	repairHistory: boolean;
 };
 
 const DEFAULTS: RetryConfig = {
 	// Unlimited by default: a relay routes each attempt to a different upstream, so a finite
-	// budget can give up on a node that would have worked. History repair keeps retries from
-	// repeating the identical failing payload, and the status line plus Escape bound the cost.
+	// budget can give up on a node that would have worked. The status line plus Escape bound
+	// the cost of an outage.
 	maxRetries: 0,
 	baseDelayMs: 2000,
 	maxDelayMs: 60000,
@@ -47,6 +48,26 @@ const QUOTA = new RegExp([
 	"insufficient_quota", "out of budget", "quota exceeded", "billing",
 	"subscription_sharing_usage_limit_exceeded", "subscription_sharing_workplace_individual_usage_limit_exceeded",
 ].join("|"), "i");
+
+/**
+ * The upstream explicitly says the session's history items belong to another resource or
+ * account, so this node can never resolve them. Only then is dropping ids worth losing the
+ * model's cross-turn memory: retrying the same ids would fail forever.
+ *
+ * Matched narrowly on purpose. A generic 400, a rate limit or an unmapped error says nothing
+ * about id validity, and stripping ids for those would degrade every retry for no reason.
+ */
+const SESSION_IDS_DEAD = [
+	/created under a different azure openai resource/i,
+	/belongs to a different upstream account/i,
+	/replayed conversation state belongs to a different/i,
+	/(?:previous_response_id|item|session)[^.]{0,40}(?:not found|does not exist|unknown|invalid|expired)/i,
+];
+
+function sessionIdsAreDead(error: string | undefined): boolean {
+	if (!error) return false;
+	return SESSION_IDS_DEAD.some(pattern => pattern.test(error));
+}
 
 function backoff(config: RetryConfig, attempt: number): number {
 	const raw = config.baseDelayMs * 2 ** Math.max(0, attempt - 1);
@@ -154,9 +175,10 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	});
 
 	// Repair only the request this extension retried, so ordinary requests keep their exact
-	// history and prompt-cache prefix.
+	// history and prompt-cache prefix. Disarmed as soon as one request has been repaired.
 	pi.on("before_provider_request", (event) => {
 		if (!repairArmed || !config.repairHistory) return undefined;
+		repairArmed = false;
 		const result = repairPayload(event.payload);
 		if (!result) return undefined;
 		repairedTotal += result.removed;
@@ -183,10 +205,13 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		consecutive++;
 		const delay = backoff(config, consecutive);
 		const budget = config.maxRetries > 0 ? `/${config.maxRetries}` : "";
+		// Only a reported dead session justifies trading memory for a replayable history.
+		const deadSession = config.repairHistory && sessionIdsAreDead(last.errorMessage);
 
 		// A footer status is always visible and survives the wait, unlike a notification.
 		if (ctx.hasUI) {
-			ctx.ui.setStatus(STATUS_KEY, `⏳ 上游报错，重试第 ${consecutive}${budget} 次 · 等待 ${Math.round(delay / 1000)}s · Esc 取消`);
+			const why = deadSession ? " · 会话 id 已失效，将剥离历史 id" : "";
+			ctx.ui.setStatus(STATUS_KEY, `⏳ 上游报错，重试第 ${consecutive}${budget} 次 · 等待 ${Math.round(delay / 1000)}s${why} · Esc 取消`);
 			ctx.ui.setWorkingMessage(`等待重试（第 ${consecutive}${budget} 次）· ${Math.round(delay / 1000)}s`);
 		}
 
@@ -209,7 +234,8 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 			return undefined;
 		}
 
-		repairArmed = true;
+		// History stays byte-identical unless the upstream said the ids are unusable.
+		repairArmed = deadSession;
 		return {
 			continue: true,
 			entries: [{ type: "custom_message" as const, customType: "resilient-retry", content: CONTINUATION, display: false }],

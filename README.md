@@ -49,23 +49,33 @@ line plus Escape bound what an outage costs you.
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
 | `retryQuotaErrors` | `false` | Also retry quota/billing errors, which retrying usually cannot fix. |
-| `repairHistory` | `true` | On a retry, drop replay-only history item ids so another upstream node can accept the conversation. |
+| `repairHistory` | `true` | Allow dropping replay-only history ids, only when the upstream reports the session ids are unusable. |
 
 `maxRetries` resets after any successful request, so it bounds one outage, not the whole
 session.
 
-## Why a retry is not just the same request again
+## History repair is gated
 
-A relay answers each attempt with whichever upstream node it picks. Replaying the exact
-same payload can therefore fail forever: history items minted by node A carry ids that node
-B refuses to resolve (`The requested item was created under a different Azure OpenAI
-resource`).
+Retrying the identical payload can fail forever when a relay answers with an upstream node
+that refuses the previous node's history (`The requested item was created under a different
+Azure OpenAI resource`). Dropping the history item ids makes the conversation replayable by
+any node — but it also costs the model its cross-turn memory, so it is **not** done for
+every retry.
 
-On a retried request the extension drops the optional `id` of complete history items.
-Message bodies, tool call pairs, `call_id`, `encrypted_content` and every reasoning item
-survive, so the model keeps its cross-turn state and the request becomes replayable by any
-node. Ordinary requests are never touched, so their prompt-cache prefix stays intact.
-Set `repairHistory: false` to send retries byte-identical instead.
+Repair runs only when the upstream explicitly reports that the session's ids are unusable:
+
+| Trigger | |
+|---|---|
+| `created under a different Azure OpenAI resource` | The observed failure in a relay pool. |
+| `belongs to a different upstream account` | Same class of replay rejection. |
+| `previous_response_id` / `item` / `session` … `not found` \| `expired` \| `invalid` | The id no longer resolves. |
+
+Every other failure — a plain 400, a 429, a 503, a dropped stream — retries with the
+history **byte-identical**, so the model keeps its memory and the prompt-cache prefix stays
+intact. When repair does run, only the optional `id` of complete items is dropped; message
+bodies, tool call pairs, `call_id`, `encrypted_content` and reasoning items all survive.
+
+Set `repairHistory: false` to disable repair entirely.
 
 ## Visible progress
 
@@ -82,9 +92,10 @@ session cancels the wait within a quarter second.
 - **No quota guessing.** Billing and quota errors are excluded by default because
   repeating them just burns time. Turn on `retryQuotaErrors` if your proxy reports
   temporary quota as a quota error.
-- **No error-text filtering.** A relay fronts many upstreams, so a rejection from one node
-  says nothing about the next. Every failure gets another attempt, bounded only by
-  `maxRetries`. Only quota/billing wording is opt-in.
+- **No error-text filtering for retries.** A relay fronts many upstreams, so a rejection
+  from one node says nothing about the next. Every failure gets another attempt. Error text
+  is read for one thing only: deciding whether the session ids are dead. Only quota/billing
+  wording is opt-in.
 
 ## Relationship to Pi's built-in retry
 
