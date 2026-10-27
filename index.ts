@@ -18,6 +18,11 @@ type RetryConfig = {
 	maxDelayMs: number;
 	/** Also retry errors Pi classifies as quota/billing (it never retries those). */
 	retryQuotaErrors: boolean;
+	/**
+	 * Drop replay-only item ids on retries. A relay may answer with a resource that cannot
+	 * resolve ids minted by the previous node; without this the same history keeps failing.
+	 */
+	repairHistory: boolean;
 };
 
 const DEFAULTS: RetryConfig = {
@@ -27,6 +32,7 @@ const DEFAULTS: RetryConfig = {
 	baseDelayMs: 2000,
 	maxDelayMs: 60000,
 	retryQuotaErrors: false,
+	repairHistory: true,
 };
 
 const CONTINUATION = "The previous provider request failed. Repeat it unchanged. Do not answer the user, do not call tools, do not explain the failure.";
@@ -41,32 +47,18 @@ const QUOTA = new RegExp([
 	"subscription_sharing_usage_limit_exceeded", "subscription_sharing_workplace_individual_usage_limit_exceeded",
 ].join("|"), "i");
 
-/**
- * Deterministic rejections: the identical request fails identically every time, so a retry
- * only burns time and tokens. Observed in the wild as a pooled upstream answering with a
- * different resource than the one that minted the conversation history.
- */
-const DETERMINISTIC = new RegExp([
-	"created under a different azure openai resource",
-	"belongs to a different upstream account",
-	"invalid_request_error", "invalid api key", "unauthorized", "authentication", "permission_denied",
-	"context_length_exceeded", "maximum context length",
-].join("|"), "i");
-
 function backoff(config: RetryConfig, attempt: number): number {
 	const raw = config.baseDelayMs * 2 ** Math.max(0, attempt - 1);
 	return Math.min(Number.isSafeInteger(raw) ? raw : Number.MAX_SAFE_INTEGER, config.maxDelayMs);
 }
 
 /**
- * Pi gives up on far more than it retries. This extension picks up what Pi refuses, except
- * failures where repeating the identical request cannot change the outcome.
- * Deny-list rather than Pi's allow-list, because an unmapped upstream message is usually
- * still transient behind a routing proxy, and the retry budget bounds the cost.
+ * A relay routes each attempt to a different upstream, so even a "deterministic" rejection
+ * may succeed on the next node. Nothing is excluded on error text alone; the retry budget
+ * is what bounds the cost.
  */
 function shouldRetry(error: string | undefined, config: RetryConfig): boolean {
 	if (!error) return false;
-	if (DETERMINISTIC.test(error)) return false;
 	if (QUOTA.test(error)) return config.retryQuotaErrors;
 	return true;
 }
@@ -80,7 +72,53 @@ function readConfig(settings: unknown): RetryConfig {
 		baseDelayMs: num(raw?.baseDelayMs, DEFAULTS.baseDelayMs),
 		maxDelayMs: num(raw?.maxDelayMs, DEFAULTS.maxDelayMs),
 		retryQuotaErrors: raw?.retryQuotaErrors === true,
+		repairHistory: raw?.repairHistory !== false,
 	};
+}
+
+const REPLAYABLE_ROLES = new Set(["user", "assistant", "system", "developer"]);
+
+/** A history item whose payload alone carries its meaning, so its id can be dropped. */
+function isCompleteReplayable(item: Record<string, unknown>): boolean {
+	const kind = typeof item.type === "string" ? item.type : "message";
+	switch (kind) {
+		case "message":
+			return REPLAYABLE_ROLES.has(item.role as string) &&
+				(typeof item.content === "string" || Array.isArray(item.content));
+		case "function_call":
+			return typeof item.call_id === "string" && typeof item.name === "string" && typeof item.arguments === "string";
+		case "custom_tool_call":
+			return typeof item.call_id === "string" && typeof item.name === "string" && typeof item.input === "string";
+		case "function_call_output":
+		case "custom_tool_call_output":
+			return typeof item.call_id === "string" &&
+				(typeof item.output === "string" || Array.isArray(item.output));
+		default:
+			return false;
+	}
+}
+
+/**
+ * Drop the optional `id` of complete history items so a different upstream node can accept
+ * the replayed conversation. Message bodies, tool pairs, `call_id` and reasoning items all
+ * survive, so the model keeps its cross-turn state.
+ */
+function repairPayload(payload: unknown): { payload: unknown; removed: number } | undefined {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+	const body = payload as Record<string, unknown>;
+	if (!Array.isArray(body.input)) return undefined;
+	let removed = 0;
+	const kept = body.input.map(entry => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
+		const item = entry as Record<string, unknown>;
+		if (typeof item.id !== "string" || !item.id) return entry;
+		if (item.status !== undefined && item.status !== "completed") return entry;
+		if (!isCompleteReplayable(item)) return entry;
+		const { id: _dropped, ...rest } = item;
+		removed++;
+		return rest;
+	});
+	return removed > 0 ? { payload: { ...body, input: kept }, removed } : undefined;
 }
 
 export default function registerResilientRetry(pi: ExtensionAPI): void {
@@ -89,6 +127,9 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	let config = DEFAULTS;
 	let cancelled = false;
 	let wake: (() => void) | undefined;
+	// Armed only while a retry this extension started is in flight.
+	let repairArmed = false;
+	let repairedTotal = 0;
 
 	const STATUS_KEY = "resilient-retry";
 
@@ -109,6 +150,16 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		cancelled = true;
 		wake?.();
+	});
+
+	// Repair only the request this extension retried, so ordinary requests keep their exact
+	// history and prompt-cache prefix.
+	pi.on("before_provider_request", (event) => {
+		if (!repairArmed || !config.repairHistory) return undefined;
+		const result = repairPayload(event.payload);
+		if (!result) return undefined;
+		repairedTotal += result.removed;
+		return result.payload;
 	});
 
 	pi.on("agent_before_settle", async (event, ctx) => {
@@ -157,6 +208,7 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 			return undefined;
 		}
 
+		repairArmed = true;
 		return {
 			continue: true,
 			entries: [{ type: "custom_message" as const, customType: "resilient-retry", content: CONTINUATION, display: false }],
@@ -168,10 +220,12 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		const last = event.messages.filter(message => message.role === "assistant").at(-1);
 		if (last?.role === "assistant" && last.stopReason !== "error") {
 			if (consecutive > 0 && ctx.hasUI) {
-				ctx.ui.notify(`上游已恢复（重试 ${consecutive} 次后成功）`, "info");
+				const repaired = repairedTotal > 0 ? `，并清理 ${repairedTotal} 个历史 id` : "";
+				ctx.ui.notify(`上游已恢复（重试 ${consecutive} 次后成功${repaired}）`, "info");
 				ctx.ui.setWorkingMessage();
 			}
 			consecutive = 0;
+			repairedTotal = 0;
 			clearUi(ctx);
 		}
 	});

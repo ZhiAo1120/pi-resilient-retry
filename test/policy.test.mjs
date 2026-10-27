@@ -120,27 +120,18 @@ test("a non-error settle boundary is ignored", async () => {
 	assert.equal(retries(result), false);
 });
 
-test("the Azure resource-attribution 400 is not retried", async () => {
+test("a relay rejection is retried: the next node may accept it", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
 	const error =
 		'agentrouter-github API error (400): {"message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it. [trace_id=4c18025ce4727ec73372a3ca4c1e1195]","type":"invalid_request_error","param":"","code":null}';
-	assert.equal(retries(await h.settle(error)), false);
+	assert.equal(retries(await h.settle(error)), true);
 });
 
-test("the replayed-account mismatch is not retried", async () => {
+test("an auth rejection is retried too: relay keys differ per node", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
-	assert.equal(
-		retries(await h.settle("The replayed conversation state belongs to a different upstream account. Start a new conversation (or drop the replayed history) and retry.")),
-		false,
-	);
-});
-
-test("retryQuotaErrors does not unlock deterministic failures", async () => {
-	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, retryQuotaErrors: true } });
-	await h.start();
-	assert.equal(retries(await h.settle("400: created under a different Azure OpenAI resource")), false);
+	assert.equal(retries(await h.settle("401: invalid api key for this upstream")), true);
 });
 
 test("the default budget is finite", async () => {
@@ -159,4 +150,50 @@ test("a retry shows visible status while waiting", async () => {
 	await new Promise(r => setTimeout(r, 10));
 	assert.match(JSON.stringify(h.statuses), /重试第 1/);
 	await pending;
+});
+
+test("a retried request drops replay ids so another node can accept it", async () => {
+	const handlers = new Map();
+	const pi = {
+		on: (name, handler) => handlers.set(name, handler),
+		getSettings: () => ({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } }),
+	};
+	register(pi);
+	const ctx = { hasUI: false, signal: undefined, ui: { notify() {}, setStatus() {}, setWorkingMessage() {} } };
+	handlers.get("session_start")({}, ctx);
+	await handlers.get("agent_before_settle")(
+		{
+			outcome: "error",
+			entries: [],
+			context: { contextMessages: [{ role: "assistant", stopReason: "error", errorMessage: "400: different resource" }] },
+		},
+		ctx,
+	);
+	const payload = {
+		model: "m",
+		input: [
+			{ type: "message", role: "user", id: "msg_abc", content: [{ type: "input_text", text: "hi" }] },
+			{ type: "reasoning", id: "rs_xyz", encrypted_content: "keep-me", summary: [] },
+			{ type: "function_call", id: "fc_1", call_id: "call_1", name: "read", arguments: "{}" },
+			{ type: "function_call_output", id: "fco_1", call_id: "call_1", output: "ok" },
+		],
+	};
+	const repaired = handlers.get("before_provider_request")({ type: "before_provider_request", payload });
+	assert.deepEqual(
+		repaired.input.map(i => i.id),
+		[undefined, "rs_xyz", undefined, undefined],
+	);
+	// Reasoning items and call ids must survive; only replay-only ids are dropped.
+	assert.equal(repaired.input[1].encrypted_content, "keep-me");
+	assert.equal(repaired.input[2].call_id, "call_1");
+	assert.deepEqual(repaired.input[0].content, [{ type: "input_text", text: "hi" }]);
+});
+
+test("ordinary requests are never repaired", async () => {
+	const handlers = new Map();
+	const pi = { on: (n, h) => handlers.set(n, h), getSettings: () => ({}) };
+	register(pi);
+	handlers.get("session_start")({}, { hasUI: false, ui: {} });
+	const payload = { input: [{ type: "message", role: "user", id: "msg_abc", content: "hi" }] };
+	assert.equal(handlers.get("before_provider_request")({ type: "before_provider_request", payload }), undefined);
 });
