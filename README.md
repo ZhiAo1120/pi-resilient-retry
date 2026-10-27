@@ -25,8 +25,10 @@ per-session setup.
 
 ## Settings
 
-Optional. The default budget is finite on purpose: a failure the upstream repeats forever
-must not become an unbounded request storm.
+Optional. The default budget is unlimited, because a relay routes each attempt to a
+different upstream and a finite budget can give up on a node that would have worked.
+History repair keeps retries from replaying the identical failing payload, and the status
+line plus Escape bound what an outage costs you.
 
 ```json
 {
@@ -43,7 +45,7 @@ must not become an unbounded request storm.
 | Setting | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Turn the extension off without uninstalling it. |
-| `maxRetries` | `20` | Consecutive retries allowed without a successful request. `0` = unlimited. |
+| `maxRetries` | `0` | Consecutive retries allowed without a successful request. `0` = unlimited; set a number to cap one outage. |
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
 | `retryQuotaErrors` | `false` | Also retry quota/billing errors, which retrying usually cannot fix. |

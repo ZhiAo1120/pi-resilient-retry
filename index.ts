@@ -26,9 +26,10 @@ type RetryConfig = {
 };
 
 const DEFAULTS: RetryConfig = {
-	// A finite default: an unlimited retry on a failure the upstream repeats forever turns
-	// one bad request into an unbounded request storm. Raise it when you mean it.
-	maxRetries: 20,
+	// Unlimited by default: a relay routes each attempt to a different upstream, so a finite
+	// budget can give up on a node that would have worked. History repair keeps retries from
+	// repeating the identical failing payload, and the status line plus Escape bound the cost.
+	maxRetries: 0,
 	baseDelayMs: 2000,
 	maxDelayMs: 60000,
 	retryQuotaErrors: false,

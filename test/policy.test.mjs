@@ -134,13 +134,12 @@ test("an auth rejection is retried too: relay keys differ per node", async () =>
 	assert.equal(retries(await h.settle("401: invalid api key for this upstream")), true);
 });
 
-test("the default budget is finite", async () => {
-	// Keep the real default in view but shrink delays so the test stays fast.
+test("the default budget is unlimited", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
 	let attempts = 0;
-	while (attempts < 100 && retries(await h.settle("upstream sent an error event"))) attempts++;
-	assert.equal(attempts, 20);
+	while (attempts < 60 && retries(await h.settle("upstream sent an error event"))) attempts++;
+	assert.equal(attempts, 60);
 });
 
 test("a retry shows visible status while waiting", async () => {
