@@ -25,7 +25,8 @@ per-session setup.
 
 ## Settings
 
-Optional. Defaults keep retrying indefinitely, which is what a long unattended run wants.
+Optional. The default budget is finite on purpose: a failure the upstream repeats forever
+must not become an unbounded request storm.
 
 ```json
 {
@@ -42,13 +43,20 @@ Optional. Defaults keep retrying indefinitely, which is what a long unattended r
 | Setting | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Turn the extension off without uninstalling it. |
-| `maxRetries` | `0` | Consecutive retries allowed without a successful request. `0` = unlimited. |
+| `maxRetries` | `20` | Consecutive retries allowed without a successful request. `0` = unlimited. |
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
 | `retryQuotaErrors` | `false` | Also retry quota/billing errors, which retrying usually cannot fix. |
 
 `maxRetries` resets after any successful request, so it bounds one outage, not the whole
 session.
+
+## Visible progress
+
+A retry is never silent. While waiting you get a footer status
+(`⏳ 上游报错，重试第 3/20 次 · 等待 12s · Esc 取消`), the working message shows the same,
+and recovery or exhaustion is reported in the transcript. Escape, `/stop`, or closing the
+session cancels the wait within a quarter second.
 
 ## What it does not do
 
@@ -58,6 +66,17 @@ session.
 - **No quota guessing.** Billing and quota errors are excluded by default because
   repeating them just burns time. Turn on `retryQuotaErrors` if your proxy reports
   temporary quota as a quota error.
+- **No retry of deterministic rejections.** These fail identically every time, so a retry
+  cannot change the outcome and only burns tokens:
+
+  | Error | Why a retry cannot help |
+  |---|---|
+  | `created under a different Azure OpenAI resource` | The history was minted by another upstream resource; the payload must change, not repeat. |
+  | `belongs to a different upstream account` | Same class of replay rejection. |
+  | `invalid_request_error`, `invalid api key`, `unauthorized`, `authentication`, `permission_denied` | Credentials or request shape are wrong. |
+  | `context_length_exceeded` | Pi compacts instead; repeating the same request cannot fit. |
+
+  `retryQuotaErrors` does not unlock these.
 
 ## Relationship to Pi's built-in retry
 

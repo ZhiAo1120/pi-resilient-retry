@@ -21,7 +21,9 @@ type RetryConfig = {
 };
 
 const DEFAULTS: RetryConfig = {
-	maxRetries: 0,
+	// A finite default: an unlimited retry on a failure the upstream repeats forever turns
+	// one bad request into an unbounded request storm. Raise it when you mean it.
+	maxRetries: 20,
 	baseDelayMs: 2000,
 	maxDelayMs: 60000,
 	retryQuotaErrors: false,
@@ -30,18 +32,26 @@ const DEFAULTS: RetryConfig = {
 const CONTINUATION = "The previous provider request failed. Repeat it unchanged. Do not answer the user, do not call tools, do not explain the failure.";
 
 /**
- * Allow-list: retrying cannot fix these, so they stay out of the default policy.
+ * Quota and billing errors. Retrying usually cannot fix them, so they are opt-in.
  * Kept in sync with pi-coding-agent's NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.
  */
-const NON_RETRYABLE = new RegExp([
+const QUOTA = new RegExp([
 	"GoUsageLimitError", "FreeUsageLimitError", "Monthly usage limit reached", "available balance",
 	"insufficient_quota", "out of budget", "quota exceeded", "billing",
 	"subscription_sharing_usage_limit_exceeded", "subscription_sharing_workplace_individual_usage_limit_exceeded",
 ].join("|"), "i");
 
-function sleep(ms: number): Promise<void> {
-	return new Promise(resolve => setTimeout(resolve, ms));
-}
+/**
+ * Deterministic rejections: the identical request fails identically every time, so a retry
+ * only burns time and tokens. Observed in the wild as a pooled upstream answering with a
+ * different resource than the one that minted the conversation history.
+ */
+const DETERMINISTIC = new RegExp([
+	"created under a different azure openai resource",
+	"belongs to a different upstream account",
+	"invalid_request_error", "invalid api key", "unauthorized", "authentication", "permission_denied",
+	"context_length_exceeded", "maximum context length",
+].join("|"), "i");
 
 function backoff(config: RetryConfig, attempt: number): number {
 	const raw = config.baseDelayMs * 2 ** Math.max(0, attempt - 1);
@@ -49,13 +59,15 @@ function backoff(config: RetryConfig, attempt: number): number {
 }
 
 /**
- * Everything Pi gives up on gets another attempt, except the cases retrying cannot fix.
- * Deny-list rather than Pi's allow-list: a 400 or an unmapped upstream message is still
- * usually transient behind a routing proxy, and the retry budget bounds the cost.
+ * Pi gives up on far more than it retries. This extension picks up what Pi refuses, except
+ * failures where repeating the identical request cannot change the outcome.
+ * Deny-list rather than Pi's allow-list, because an unmapped upstream message is usually
+ * still transient behind a routing proxy, and the retry budget bounds the cost.
  */
 function shouldRetry(error: string | undefined, config: RetryConfig): boolean {
 	if (!error) return false;
-	if (NON_RETRYABLE.test(error)) return config.retryQuotaErrors;
+	if (DETERMINISTIC.test(error)) return false;
+	if (QUOTA.test(error)) return config.retryQuotaErrors;
 	return true;
 }
 
@@ -75,7 +87,14 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	let consecutive = 0;
 	let enabled = true;
 	let config = DEFAULTS;
-	let lastNotified = "";
+	let cancelled = false;
+	let wake: (() => void) | undefined;
+
+	const STATUS_KEY = "resilient-retry";
+
+	const clearUi = (ctx: { hasUI: boolean; ui: { setStatus: (key: string, text: string | undefined) => void } }) => {
+		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+	};
 
 	// Settings live on `pi`, not on the event context, and are ready before any run.
 	pi.on("session_start", () => {
@@ -83,7 +102,13 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		enabled = settings.resilientRetry?.enabled !== false;
 		config = readConfig(settings);
 		consecutive = 0;
-		lastNotified = "";
+		cancelled = false;
+	});
+
+	// A retry in flight must not swallow the user's Escape or /stop.
+	pi.on("session_shutdown", () => {
+		cancelled = true;
+		wake?.();
 	});
 
 	pi.on("agent_before_settle", async (event, ctx) => {
@@ -93,21 +118,44 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 
 		const messages = event.context.contextMessages as { role: string; stopReason?: string; errorMessage?: string }[];
 		const last = [...messages].reverse().find(message => message.role === "assistant");
-		if (last?.stopReason !== "error" || !shouldRetry(last.errorMessage, config)) return undefined;
-		if (config.maxRetries > 0 && consecutive >= config.maxRetries) return undefined;
+		if (last?.stopReason !== "error" || !shouldRetry(last.errorMessage, config)) {
+			clearUi(ctx);
+			return undefined;
+		}
+		if (config.maxRetries > 0 && consecutive >= config.maxRetries) {
+			clearUi(ctx);
+			if (ctx.hasUI) ctx.ui.notify(`上游连续失败 ${consecutive} 次，已停止重试。${last.errorMessage?.slice(0, 200) ?? ""}`, "error");
+			return undefined;
+		}
 
 		consecutive++;
 		const delay = backoff(config, consecutive);
+		const budget = config.maxRetries > 0 ? `/${config.maxRetries}` : "";
+
+		// A footer status is always visible and survives the wait, unlike a notification.
 		if (ctx.hasUI) {
-			const line = `上游报错，${Math.round(delay / 1000)}s 后重试（第 ${consecutive}${config.maxRetries > 0 ? `/${config.maxRetries}` : ""} 次）`;
-			// Same text on every attempt would spam the transcript; only re-notify on change.
-			if (line !== lastNotified) {
-				lastNotified = line;
-				ctx.ui.notify(line, "info");
-			}
+			ctx.ui.setStatus(STATUS_KEY, `⏳ 上游报错，重试第 ${consecutive}${budget} 次 · 等待 ${Math.round(delay / 1000)}s · Esc 取消`);
+			ctx.ui.setWorkingMessage(`等待重试（第 ${consecutive}${budget} 次）· ${Math.round(delay / 1000)}s`);
 		}
-		await sleep(delay);
-		if (ctx.signal?.aborted) return undefined;
+
+		// Sleep in slices so an abort during the wait is honoured within one slice.
+		cancelled = false;
+		const deadline = Date.now() + delay;
+		while (Date.now() < deadline && !cancelled && !ctx.signal?.aborted) {
+			const slice = Math.min(250, deadline - Date.now());
+			await new Promise<void>(resolve => {
+				const timer = setTimeout(resolve, slice);
+				wake = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+			});
+		}
+		wake = undefined;
+		if (cancelled || ctx.signal?.aborted) {
+			clearUi(ctx);
+			return undefined;
+		}
 
 		return {
 			continue: true,
@@ -116,11 +164,15 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	});
 
 	// Any request that is not an error means the upstream recovered.
-	pi.on("agent_end", (event) => {
+	pi.on("agent_end", (event, ctx) => {
 		const last = event.messages.filter(message => message.role === "assistant").at(-1);
 		if (last?.role === "assistant" && last.stopReason !== "error") {
+			if (consecutive > 0 && ctx.hasUI) {
+				ctx.ui.notify(`上游已恢复（重试 ${consecutive} 次后成功）`, "info");
+				ctx.ui.setWorkingMessage();
+			}
 			consecutive = 0;
-			lastNotified = "";
+			clearUi(ctx);
 		}
 	});
 }

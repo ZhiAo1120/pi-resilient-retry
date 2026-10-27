@@ -14,10 +14,15 @@ function harness(settings = {}) {
 		getSettings: () => settings,
 	};
 	register(pi);
+	const statuses = [];
 	const ctx = {
 		hasUI: true,
 		signal: undefined,
-		ui: { notify: message => notices.push(message) },
+		ui: {
+			notify: message => notices.push(message),
+			setStatus: (key, text) => statuses.push([key, text]),
+			setWorkingMessage: () => {},
+		},
 	};
 	const fire = (name, event, context = ctx) => handlers.get(name)?.(event, context);
 	const start = () => fire("session_start", { type: "session_start" });
@@ -39,7 +44,7 @@ function harness(settings = {}) {
 			},
 			context,
 		);
-	return { notices, start, settle, fire };
+	return { notices, statuses, start, settle, fire };
 }
 
 const retries = result => result?.continue === true;
@@ -113,4 +118,45 @@ test("a non-error settle boundary is ignored", async () => {
 		context: { contextMessages: [{ role: "assistant", stopReason: "stop" }] },
 	});
 	assert.equal(retries(result), false);
+});
+
+test("the Azure resource-attribution 400 is not retried", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
+	await h.start();
+	const error =
+		'agentrouter-github API error (400): {"message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it. [trace_id=4c18025ce4727ec73372a3ca4c1e1195]","type":"invalid_request_error","param":"","code":null}';
+	assert.equal(retries(await h.settle(error)), false);
+});
+
+test("the replayed-account mismatch is not retried", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
+	await h.start();
+	assert.equal(
+		retries(await h.settle("The replayed conversation state belongs to a different upstream account. Start a new conversation (or drop the replayed history) and retry.")),
+		false,
+	);
+});
+
+test("retryQuotaErrors does not unlock deterministic failures", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, retryQuotaErrors: true } });
+	await h.start();
+	assert.equal(retries(await h.settle("400: created under a different Azure OpenAI resource")), false);
+});
+
+test("the default budget is finite", async () => {
+	// Keep the real default in view but shrink delays so the test stays fast.
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
+	await h.start();
+	let attempts = 0;
+	while (attempts < 100 && retries(await h.settle("upstream sent an error event"))) attempts++;
+	assert.equal(attempts, 20);
+});
+
+test("a retry shows visible status while waiting", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 30, maxDelayMs: 30 } });
+	await h.start();
+	const pending = h.settle("upstream sent an error event");
+	await new Promise(r => setTimeout(r, 10));
+	assert.match(JSON.stringify(h.statuses), /重试第 1/);
+	await pending;
 });
