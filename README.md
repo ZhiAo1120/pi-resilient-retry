@@ -2,6 +2,24 @@
 
 Keep retrying failed upstream API requests that Pi's built-in retry gives up on.
 
+English | [中文](README.zh-CN.md)
+
+## Install them together
+
+This extension keeps the task running. If you also want to **resume a failed turn by hand**,
+install [pi-retry](https://github.com/ZhiAo1120/pi-retry) alongside it:
+
+| | pi-resilient-retry (this) | pi-retry |
+|---|---|---|
+| Trigger | Automatic, retries on failure | You type `/retry` |
+| Job | Retry in the background so the task is not interrupted | Resume from the checkpoint without replaying finished work |
+| Budget | Unlimited (configurable) | 3 failed requests, then it stops with a reason |
+| History repair | Drops ids only when the upstream reports the ids are dead | `/retry` drops ids; `--deep` also drops reasoning |
+
+The lifecycle hooks do not conflict, so both can be installed. One keeps the task
+alive; the other makes your manual intervention precise. They complement rather than
+replace each other.
+
 Pi already retries transient provider errors — overloaded, 429, 5xx, timeouts, dropped
 streams — up to `retry.maxRetries`. Everything else ends the run immediately. That is
 the usual reason a flaky routing proxy kills a long task: a `400` from the upstream, an
@@ -15,7 +33,7 @@ user did not abort, it waits out a backoff delay and continues the run.
 ## Install
 
 ```bash
-pi install git:github.com/<you>/pi-resilient-retry
+pi install git:github.com/ZhiAo1120/pi-resilient-retry
 # or, during development, load a checkout directly
 pi install /path/to/pi-resilient-retry
 ```

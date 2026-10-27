@@ -2,16 +2,38 @@
   "name": "pi-resilient-retry",
   "version": "0.1.0",
   "description": "Keep retrying failed provider requests that Pi's built-in retry gives up on",
-  "keywords": ["pi-package", "pi-extension", "pi", "retry", "resilience"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "retry",
+    "resilience"
+  ],
   "type": "module",
-  "engines": { "node": ">=22.19.0" },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "license": "MIT",
-  "files": ["index.ts", "README.md", "LICENSE"],
+  "files": [
+    "index.ts",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.mjs",
     "check": "tsc --noEmit --strict --target ES2022 --module NodeNext --skipLibCheck index.ts"
   },
-  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
-  "pi": { "extensions": ["./index.ts"] },
-  "devDependencies": { "@earendil-works/pi-coding-agent": "^1.4.0", "typescript": "^5.6.0" }
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "typescript": "^5.6.0"
+  }
 }
