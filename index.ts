@@ -25,6 +25,12 @@ type RetryConfig = {
 	 * the history intact so the model keeps its memory.
 	 */
 	repairHistory: boolean;
+	/**
+	 * Stop after this many consecutive attempts that fail with the same error and never
+	 * reach the model. Unlimited retries are only safe while the failure keeps changing;
+	 * an identical failure repeating forever means the request itself cannot succeed.
+	 */
+	repeatLimit: number;
 	/** Append a JSON line per decision to this path. Diagnoses silent non-retries. */
 	debugLog?: string;
 };
@@ -38,17 +44,8 @@ const DEFAULTS: RetryConfig = {
 	maxDelayMs: 60000,
 	retryQuotaErrors: false,
 	repairHistory: true,
+	repeatLimit: 10,
 };
-
-const CONTINUATION = "The previous provider request failed. Repeat it unchanged. Do not answer the user, do not call tools, do not explain the failure.";
-
-/**
- * Shown instead of CONTINUATION on the first retry of a burst. Percho ignores the extension
- * notify/status channels, so the transcript is the only place a retry is attributable — one
- * visible line per burst, not one per attempt.
- */
-const CONTINUATION_VISIBLE =
-	"↻ pi-resilient-retry：上游请求失败，自动重试中。Repeat the previous request unchanged; do not answer the user, do not call tools.";
 
 /**
  * Quota and billing errors. Retrying usually cannot fix them, so they are opt-in.
@@ -106,6 +103,7 @@ function readConfig(settings: unknown): RetryConfig {
 		maxDelayMs: num(raw?.maxDelayMs, DEFAULTS.maxDelayMs),
 		retryQuotaErrors: raw?.retryQuotaErrors === true,
 		repairHistory: raw?.repairHistory !== false,
+		repeatLimit: num(raw?.repeatLimit, DEFAULTS.repeatLimit),
 		debugLog: typeof raw?.debugLog === "string" && raw.debugLog ? raw.debugLog : undefined,
 	};
 }
@@ -157,6 +155,8 @@ function repairPayload(payload: unknown): { payload: unknown; removed: number } 
 
 export default function registerResilientRetry(pi: ExtensionAPI): void {
 	let consecutive = 0;
+	let lastFingerprint = "";
+	let sameErrorCount = 0;
 	let enabled = true;
 	let config = DEFAULTS;
 	let cancelled = false;
@@ -187,6 +187,8 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		enabled = settings.resilientRetry?.enabled !== false;
 		config = readConfig(settings);
 		consecutive = 0;
+		lastFingerprint = "";
+		sameErrorCount = 0;
 		cancelled = false;
 		debug({ event: "session_start", enabled, config: { ...config, debugLog: config.debugLog } });
 	});
@@ -236,6 +238,20 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 			clearUi(ctx);
 			return undefined;
 		}
+		const fingerprint = (last.errorMessage ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+		if (fingerprint === lastFingerprint) sameErrorCount++;
+		else {
+			lastFingerprint = fingerprint;
+			sameErrorCount = 1;
+		}
+		if (config.repeatLimit > 0 && sameErrorCount > config.repeatLimit) {
+			debug({ ...seen, decision: "skip: same error repeated", sameErrorCount });
+			clearUi(ctx);
+			if (ctx.hasUI) {
+				ctx.ui.notify(`同一错误已连续出现 ${sameErrorCount} 次，重试无法解决，已停止。${(last.errorMessage ?? "").slice(0, 200)}`, "error");
+			}
+			return undefined;
+		}
 		if (config.maxRetries > 0 && consecutive >= config.maxRetries) {
 			debug({ ...seen, decision: "skip: budget exhausted", consecutive });
 			clearUi(ctx);
@@ -279,20 +295,18 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 
 		// History stays byte-identical unless the upstream said the ids are unusable.
 		repairArmed = deadSession;
-		// The first retry of a burst is written as a visible transcript line so the retry is
-		// attributable in clients that ignore notify/setStatus; later attempts stay hidden.
-		const visible = consecutive === 1;
-		return {
-			continue: true,
-			entries: [
-				{
-					type: "custom_message" as const,
-					customType: "resilient-retry",
-					content: visible ? CONTINUATION_VISIBLE : CONTINUATION,
-					display: visible,
-				},
-			],
-		};
+
+		// A real user message, not a custom one: Percho renders neither extension notify/setStatus
+		// nor custom_message entries, so this is the only channel that makes a retry visible.
+		const notice = `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}。Repeat the previous request unchanged; do not answer the user, do not call tools.`;
+		try {
+			await pi.sendUserMessage(notice, { deliverAs: "followUp" });
+		} catch (error) {
+			debug({ event: "retry_send_failed", attempt: consecutive, error: String(error).slice(0, 120) });
+			clearUi(ctx);
+			return undefined;
+		}
+		return undefined;
 	});
 
 	// Any request that is not an error means the upstream recovered.
@@ -306,6 +320,8 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 			}
 			consecutive = 0;
 			repairedTotal = 0;
+			lastFingerprint = "";
+			sameErrorCount = 0;
 			clearUi(ctx);
 		}
 	});

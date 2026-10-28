@@ -138,6 +138,19 @@ A retry is never silent. While waiting you get a footer status
 and recovery or exhaustion is reported in the transcript. Escape, `/stop`, or closing the
 session cancels the wait within a quarter second.
 
+## Stopping an impossible loop
+
+Unlimited retries are only safe while the failure keeps changing. When the **same** error
+repeats with no successful request in between, repeating it cannot help, so the extension
+stops and reports it.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `repeatLimit` | `10` | Consecutive attempts allowed for one unchanged error. `0` disables the guard. |
+
+A different error each attempt (a relay rotating nodes) keeps retrying without limit; an
+identical error eleven times in a row does not. Any successful request resets the counter.
+
 ## What it does not do
 
 - **No tool replay.** The retry repeats the failed model request only; it never re-runs a
