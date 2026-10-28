@@ -31,6 +31,11 @@ type RetryConfig = {
 	 * an identical failure repeating forever means the request itself cannot succeed.
 	 */
 	repeatLimit: number;
+	/**
+	 * When a retry is written into the conversation so it is visible in the UI.
+	 * `first` costs one short message per outage; `never` leaves the context untouched.
+	 */
+	visibleRetry: "first" | "always" | "never";
 	/** Append a JSON line per decision to this path. Diagnoses silent non-retries. */
 	debugLog?: string;
 };
@@ -45,6 +50,7 @@ const DEFAULTS: RetryConfig = {
 	retryQuotaErrors: false,
 	repairHistory: true,
 	repeatLimit: 30,
+	visibleRetry: "first",
 };
 
 /**
@@ -104,6 +110,7 @@ function readConfig(settings: unknown): RetryConfig {
 		retryQuotaErrors: raw?.retryQuotaErrors === true,
 		repairHistory: raw?.repairHistory !== false,
 		repeatLimit: num(raw?.repeatLimit, DEFAULTS.repeatLimit),
+		visibleRetry: raw?.visibleRetry === "always" || raw?.visibleRetry === "never" ? raw.visibleRetry : DEFAULTS.visibleRetry,
 		debugLog: typeof raw?.debugLog === "string" && raw.debugLog ? raw.debugLog : undefined,
 	};
 }
@@ -296,17 +303,35 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		// History stays byte-identical unless the upstream said the ids are unusable.
 		repairArmed = deadSession;
 
-		// A real user message, not a custom one: Percho renders neither extension notify/setStatus
-		// nor custom_message entries, so this is the only channel that makes a retry visible.
-		const notice = `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}。Repeat the previous request unchanged; do not answer the user, do not call tools.`;
-		try {
-			await pi.sendUserMessage(notice, { deliverAs: "followUp" });
-		} catch (error) {
-			debug({ event: "retry_send_failed", attempt: consecutive, error: String(error).slice(0, 120) });
+		const visible = config.visibleRetry === "always" || (config.visibleRetry === "first" && consecutive === 1);
+		if (visible) {
+			// One real user message makes the retry visible; Percho renders neither notify,
+			// setStatus nor custom_message. Cost is one short message per outage.
+			const notice = `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}。Repeat the previous request unchanged; do not answer the user, do not call tools.`;
+			try {
+				await pi.sendUserMessage(notice, { deliverAs: "followUp" });
+			} catch (error) {
+				debug({ event: "retry_send_failed", attempt: consecutive, error: String(error).slice(0, 120) });
+				clearUi(ctx);
+			}
+			return undefined;
+		}
+
+		// Silent retry: drop the failed attempt from model context instead of appending anything.
+		// The continuation then runs from the last user turn, so a retry adds no tokens and the
+		// conversation does not grow with each attempt.
+		const failed = [...event.context.contextEntries]
+			.reverse()
+			.find(entry => entry.messages.includes(last as never));
+		if (!failed) {
+			debug({ event: "retry_no_target", attempt: consecutive });
 			clearUi(ctx);
 			return undefined;
 		}
-		return undefined;
+		return {
+			continue: true,
+			entries: [{ type: "context_edit" as const, targetId: failed.sourceEntry.id, replacement: null }],
+		};
 	});
 
 	// Any request that is not an error means the upstream recovered.

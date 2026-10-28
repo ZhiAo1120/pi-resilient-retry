@@ -30,9 +30,13 @@ function harness(settings = {}) {
 	};
 	const fire = (name, event, context = ctx) => handlers.get(name)?.(event, context);
 	const start = () => fire("session_start", { type: "session_start" });
+	let attemptedCount = 0;
 	/** A settle boundary whose latest assistant message failed with `error`. */
-	const settle = (error, context = ctx) =>
-		fire(
+	const settle = async (error, context = ctx) => {
+		const before = sent.length;
+		const user = { role: "user", content: "hi" };
+		const assistant = { role: "assistant", stopReason: error === undefined ? "stop" : "error", errorMessage: error };
+		const result = await fire(
 			"agent_before_settle",
 			{
 				type: "agent_before_settle",
@@ -40,53 +44,70 @@ function harness(settings = {}) {
 				entries: [],
 				continue: false,
 				context: {
-					contextMessages: [
-						{ role: "user", content: "hi" },
-						{ role: "assistant", stopReason: error === undefined ? "stop" : "error", errorMessage: error },
+					contextMessages: [user, assistant],
+					// Projected entries: the extension drops the failed assistant message by id.
+					contextEntries: [
+						{ sourceEntry: { id: "e-user" }, messages: [user] },
+						{ sourceEntry: { id: "e-assistant" }, messages: [assistant] },
 					],
 				},
 			},
 			context,
 		);
-	return { notices, statuses, sent, start, settle, fire };
+		const sentDelta = sent.length - before;
+		const attempted = result?.continue === true || sentDelta > 0;
+		if (attempted) attemptedCount++;
+		return { result, sentDelta, attempted };
+	};
+	return {
+		notices,
+		statuses,
+		sent,
+		start,
+		settle,
+		fire,
+		get attemptedCount() {
+			return attemptedCount;
+		},
+	};
 }
 
-const retries = (result, h) => (h ? h.sent.length > 0 : result?.continue === true);
+
 
 test("retries a 400 that Pi's built-in retry never retries", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
-	assert.equal(retries(await h.settle("400: different Azure OpenAI resource"), h), true);
+	assert.equal((await h.settle("400: different Azure OpenAI resource")).attempted, true);
 });
 
 test("retries unmapped upstream errors instead of giving up", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
-	assert.equal(retries(await h.settle("upstream sent an error event"), h), true);
+	assert.equal((await h.settle("upstream sent an error event")).attempted, true);
 });
 
 test("a completed run is never retried", async () => {
 	const h = harness();
 	await h.start();
-	assert.equal(retries(await h.settle(undefined), h), false);
+	assert.equal((await h.settle(undefined)).attempted, false);
 });
 
 test("quota errors stay out of the default policy", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
-	assert.equal(retries(await h.settle("insufficient_quota: billing hard limit reached"), h), false);
+	assert.equal((await h.settle("insufficient_quota: billing hard limit reached")).attempted, false);
 });
 
 test("retryQuotaErrors opts quota errors back in", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, retryQuotaErrors: true } });
 	await h.start();
-	assert.equal(retries(await h.settle("insufficient_quota"), h), true);
+	assert.equal((await h.settle("insufficient_quota")).attempted, true);
 });
 
 test("enabled: false disables the extension", async () => {
 	const h = harness({ resilientRetry: { enabled: false } });
 	await h.start();
-	assert.equal(retries(await h.settle("400: whatever"), h), false);
+	assert.equal((await h.settle("400: whatever")).attempted, false);
 });
 
 test("maxRetries bounds consecutive attempts", async () => {
@@ -95,15 +116,15 @@ test("maxRetries bounds consecutive attempts", async () => {
 	await h.settle("400: a");
 	await h.settle("400: a");
 	await h.settle("400: a");
-	assert.equal(h.sent.length, 2);
+	assert.equal(h.attemptedCount, 2);
 });
 
 test("a successful request resets the budget", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, maxRetries: 1 } });
 	await h.start();
-	assert.equal(retries(await h.settle("400: a"), h), true);
+	assert.equal((await h.settle("400: a")).attempted, true);
 	await h.fire("agent_end", { type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
-	assert.equal(retries(await h.settle("400: a"), h), true);
+	assert.equal((await h.settle("400: a")).attempted, true);
 });
 
 test("an aborted run is not retried", async () => {
@@ -111,7 +132,7 @@ test("an aborted run is not retried", async () => {
 	await h.start();
 	const controller = new AbortController();
 	controller.abort();
-	assert.equal(retries(await h.settle("400: x", { hasUI: false, signal: controller.signal, ui: { notify() {} } })), false);
+	assert.equal((await h.settle("400: x", { hasUI: false, signal: controller.signal, ui: { notify() {} } })).attempted, false);
 });
 
 test("a non-error settle boundary is ignored", async () => {
@@ -122,7 +143,7 @@ test("a non-error settle boundary is ignored", async () => {
 		entries: [],
 		context: { contextMessages: [{ role: "assistant", stopReason: "stop" }] },
 	});
-	assert.equal(retries(result), false);
+	assert.equal(result?.continue, undefined);
 });
 
 test("a relay rejection is retried: the next node may accept it", async () => {
@@ -130,21 +151,20 @@ test("a relay rejection is retried: the next node may accept it", async () => {
 	await h.start();
 	const error =
 		'agentrouter-github API error (400): {"message":"The requested item was created under a different Azure OpenAI resource. Use the same resource that created the item to access it. [trace_id=4c18025ce4727ec73372a3ca4c1e1195]","type":"invalid_request_error","param":"","code":null}';
-	assert.equal(retries(await h.settle(error), h), true);
+	assert.equal((await h.settle(error)).attempted, true);
 });
 
 test("an auth rejection is retried too: relay keys differ per node", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
-	assert.equal(retries(await h.settle("401: invalid api key for this upstream"), h), true);
+	assert.equal((await h.settle("401: invalid api key for this upstream")).attempted, true);
 });
 
 test("the default budget is unlimited", async () => {
-	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, repeatLimit: 0 } });
 	await h.start();
-	let attempts = 0;
-	while (attempts < 60 && retries(await h.settle("upstream sent an error event"), h)) attempts++;
-	assert.equal(attempts, 60);
+	for (let i = 0; i < 60; i++) await h.settle("upstream sent an error event");
+	assert.equal(h.attemptedCount, 60);
 });
 
 test("a retry shows visible status while waiting", async () => {
@@ -241,17 +261,37 @@ test("ordinary requests are never repaired", async () => {
 	assert.equal(handlers.get("before_provider_request")({ type: "before_provider_request", payload }), undefined);
 });
 
-test("every retry sends a visible user message naming the plugin and attempt", async () => {
+test("by default only the first retry of a burst is visible", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
 	await h.settle("503: unavailable");
 	await h.settle("503: unavailable");
-	assert.equal(h.sent.length, 2);
+	await h.settle("503: unavailable");
+	assert.equal(h.attemptedCount, 3);
+	assert.equal(h.sent.length, 1, "later retries must not add context");
 	assert.match(h.sent[0].content, /pi-resilient-retry/);
 	assert.match(h.sent[0].content, /第 1 次/);
-	assert.match(h.sent[1].content, /第 2 次/);
 	assert.equal(h.sent[0].options.deliverAs, "followUp");
 });
+
+test("silent retries drop the failed attempt from model context", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: "never" } });
+	await h.start();
+	const first = await h.settle("503: unavailable");
+	assert.equal(first.result.continue, true);
+	assert.deepEqual(first.result.entries, [{ type: "context_edit", targetId: "e-assistant", replacement: null }]);
+	assert.equal(h.sent.length, 0, "silent mode must not add messages");
+});
+
+test("visibleRetry: always writes every attempt", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: "always" } });
+	await h.start();
+	await h.settle("503: unavailable");
+	await h.settle("503: unavailable");
+	assert.equal(h.sent.length, 2);
+	assert.match(h.sent[1].content, /第 2 次/);
+});
+
 
 test("a dead session is announced in the retry message", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
@@ -264,14 +304,14 @@ test("the same error repeated stops retrying instead of looping forever", async 
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, repeatLimit: 3 } });
 	await h.start();
 	for (let i = 0; i < 6; i++) await h.settle("400: created under a different Azure OpenAI resource");
-	assert.equal(h.sent.length, 3, "must stop after repeatLimit attempts");
+	assert.equal(h.attemptedCount, 3, "must stop after repeatLimit attempts");
 });
 
 test("a changing error keeps retrying without limit", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, repeatLimit: 2 } });
 	await h.start();
 	for (let i = 0; i < 6; i++) await h.settle(`503: node ${i} unavailable`);
-	assert.equal(h.sent.length, 6);
+	assert.equal(h.attemptedCount, 6);
 });
 
 test("a successful request resets the repeat counter", async () => {
@@ -281,12 +321,12 @@ test("a successful request resets the repeat counter", async () => {
 	await h.settle("503: same");
 	await h.fire("agent_end", { type: "agent_end", messages: [{ role: "assistant", stopReason: "stop" }] });
 	await h.settle("503: same");
-	assert.equal(h.sent.length, 2, "after a success the same error may retry again");
+	assert.equal(h.attemptedCount, 2, "after a success the same error may retry again");
 });
 
 test("the default repeat limit allows 30 attempts of one unchanged error", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
 	for (let i = 0; i < 40; i++) await h.settle("400: same failure");
-	assert.equal(h.sent.length, 30);
+	assert.equal(h.attemptedCount, 30);
 });

@@ -131,6 +131,30 @@ Later attempts in the same burst stay hidden, so a long outage does not flood th
 conversation. The hidden continuation still goes to the model either way, so this costs no
 extra context.
 
+## 重试是否污染上下文
+
+**默认几乎不污染。** 重试有两种写入方式，按次数自动选择：
+
+| 配置项 | 默认值 | 行为 |
+|---|---|---|
+| `visibleRetry` | `"first"` | 每轮故障**只有第一次**重试写一条可见消息；后续重试零写入 |
+| `visibleRetry` | `"always"` | 每次重试都写（最吵，上下文随次数增长） |
+| `visibleRetry` | `"never"` | 完全不写，上下文零增长，但界面上看不到重试 |
+
+静默重试不新增任何消息，而是用 `context_edit` 把**失败的那次助手消息从模型上下文里删除**，
+让续跑从最后一条用户消息重新开始。因此静默重试不但不增加 token，反而让上下文更短。
+
+实测（同一个故障连续 4 次失败后恢复）：
+
+```
+visibleRetry = "never"   → 每次请求载荷恒定 5788B（零增长）
+visibleRetry = "first"   → 5788B → 5964B（只加一条，之后恒定）
+```
+
+代价对比：`first` 每轮故障多约 176 字节（约 50 token），`never` 为 0。
+
+如果你完全不需要在界面看到重试，设 `"never"` 最省。需要观察时保留 `"first"`。
+
 ## Visible progress
 
 A retry is never silent. While waiting you get a footer status
