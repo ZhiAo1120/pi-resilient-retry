@@ -44,7 +44,7 @@ const DEFAULTS: RetryConfig = {
 	maxDelayMs: 60000,
 	retryQuotaErrors: false,
 	repairHistory: true,
-	repeatLimit: 10,
+	repeatLimit: 30,
 };
 
 /**

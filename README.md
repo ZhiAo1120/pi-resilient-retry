@@ -146,7 +146,7 @@ stops and reports it.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `repeatLimit` | `10` | Consecutive attempts allowed for one unchanged error. `0` disables the guard. |
+| `repeatLimit` | `30` | Consecutive attempts allowed for one unchanged error. `0` disables the guard. |
 
 A different error each attempt (a relay rotating nodes) keeps retrying without limit; an
 identical error eleven times in a row does not. Any successful request resets the counter.

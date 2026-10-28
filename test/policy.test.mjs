@@ -283,3 +283,10 @@ test("a successful request resets the repeat counter", async () => {
 	await h.settle("503: same");
 	assert.equal(h.sent.length, 2, "after a success the same error may retry again");
 });
+
+test("the default repeat limit allows 30 attempts of one unchanged error", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
+	await h.start();
+	for (let i = 0; i < 40; i++) await h.settle("400: same failure");
+	assert.equal(h.sent.length, 30);
+});
