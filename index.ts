@@ -107,23 +107,15 @@ function shouldRetry(error: string | undefined, config: RetryConfig): boolean {
 
 const RETRY_MARKER = "pi-resilient-retry";
 
-/** True for an assistant turn that produced nothing — the failed attempt being retried. */
-function isFailedAttempt(item: Record<string, unknown>): boolean {
-	if (item.role !== "assistant") return false;
-	const content = item.content;
-	if (Array.isArray(content)) return content.length === 0;
-	return content === "" || content === undefined;
-}
-
 function isRetryNotice(item: Record<string, unknown>): boolean {
 	if (typeof item.content === "string") return item.content.includes(RETRY_MARKER);
 	return JSON.stringify(item.content ?? "").includes(RETRY_MARKER);
 }
 
 /**
- * Remove retry notices and the failed attempt from the outgoing payload. The notices stay in
- * the session so the UI can show them, but the model never sees them: the request it receives
- * is the original one, which also keeps the prompt-cache prefix stable.
+ * Remove this extension's own markers from the outgoing payload. The failed turn is not touched
+ * here — `context_edit` already drops it — and the request is never left with an empty history:
+ * an empty `input`/`messages` array makes the provider reject the call outright.
  */
 function stripRetryNoise(payload: unknown): { payload: unknown; removed: number } | undefined {
 	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
@@ -131,21 +123,24 @@ function stripRetryNoise(payload: unknown): { payload: unknown; removed: number 
 	let removed = 0;
 	const filter = (list: unknown): unknown[] | undefined => {
 		if (!Array.isArray(list)) return undefined;
-		return list.filter(entry => {
+		const kept = list.filter(entry => {
 			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return true;
-			const item = entry as Record<string, unknown>;
-			if (!isRetryNotice(item) && !isFailedAttempt(item)) return true;
+			if (!isRetryNotice(entry as Record<string, unknown>)) return true;
 			removed++;
 			return false;
 		});
+		// Never hand the provider an empty history.
+		return kept.length === 0 ? undefined : kept;
 	};
 	const messages = filter(body.messages);
 	const input = filter(body.input);
+	// Both undefined means stripping would empty the history, or there was nothing to strip.
 	if (!messages && !input) return undefined;
+	if (removed === 0) return undefined;
 	const next = { ...body };
 	if (messages) next.messages = messages;
 	if (input) next.input = input;
-	return removed > 0 ? { payload: next, removed } : undefined;
+	return { payload: next, removed };
 }
 
 function readConfig(settings: unknown): RetryConfig {

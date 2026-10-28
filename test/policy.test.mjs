@@ -260,7 +260,7 @@ test("only one request is repaired per retry", async () => {
 	);
 });
 
-test("retry markers and the failed attempt never reach the model", async () => {
+test("retry markers never reach the model", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: true } });
 	await h.start();
 	const { result } = await h.settle("503: unavailable");
@@ -273,7 +273,7 @@ test("retry markers and the failed attempt never reach the model", async () => {
 			{ role: "custom", content: marker.content },
 		]),
 	});
-	assert.deepEqual(out.messages, [{ role: "user", content: "hi" }]);
+	assert.deepEqual(out.messages, [{ role: "user", content: "hi" }, { role: "assistant", content: [] }]);
 });
 
 test("visibleRetry is off by default so nothing is written", async () => {
@@ -297,4 +297,38 @@ test("noticeEvery thins out printed retries but keeps the first", async () => {
 	assert.match(printed[0], /第 1 次/);
 	assert.match(printed[1], /第 3 次/);
 	assert.match(printed[2], /第 6 次/);
+});
+
+test("stripping never leaves an empty history", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: true } });
+	await h.start();
+	const { result } = await h.settle("503: unavailable");
+	const marker = result.entries.find(entry => entry.type === "custom_message");
+	// The only item is our own marker: removing it would empty the request.
+	const payload = { input: [{ type: "message", role: "user", content: [{ type: "input_text", text: marker.content }] }] };
+	assert.equal(h.fire("before_provider_request", { type: "before_provider_request", payload }), undefined);
+});
+
+test("stripping keeps the conversation when a marker is among real messages", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: true } });
+	await h.start();
+	const { result } = await h.settle("503: unavailable");
+	const marker = result.entries.find(entry => entry.type === "custom_message");
+	const payload = {
+		input: [
+			{ type: "message", role: "user", content: [{ type: "input_text", text: "real question" }] },
+			{ type: "message", role: "user", content: [{ type: "input_text", text: marker.content }] },
+		],
+	};
+	const out = h.fire("before_provider_request", { type: "before_provider_request", payload });
+	assert.equal(out.input.length, 1);
+	assert.equal(out.input[0].content[0].text, "real question");
+});
+
+test("the failed assistant turn is left to context_edit, not payload surgery", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
+	await h.start();
+	await h.settle("503: unavailable");
+	const payload = { input: [{ type: "message", role: "assistant", content: [] }] };
+	assert.equal(h.fire("before_provider_request", { type: "before_provider_request", payload }), undefined);
 });
