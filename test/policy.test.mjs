@@ -235,3 +235,21 @@ test("ordinary requests are never repaired", async () => {
 	const payload = { input: [{ type: "message", role: "user", id: "msg_abc", content: "hi" }] };
 	assert.equal(handlers.get("before_provider_request")({ type: "before_provider_request", payload }), undefined);
 });
+
+test("the first retry of a burst is visible, later attempts are hidden", async () => {
+	const handlers = new Map();
+	const pi = { on: (n, h) => handlers.set(n, h), getSettings: () => ({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } }) };
+	register(pi);
+	const ctx = { hasUI: false, signal: undefined, ui: { notify() {}, setStatus() {}, setWorkingMessage() {} } };
+	handlers.get("session_start")({}, ctx);
+	const settle = () =>
+		handlers.get("agent_before_settle")(
+			{ outcome: "error", entries: [], context: { contextMessages: [{ role: "assistant", stopReason: "error", errorMessage: "503: unavailable" }] } },
+			ctx,
+		);
+	const first = await settle();
+	assert.equal(first.entries[0].display, true);
+	assert.match(first.entries[0].content, /pi-resilient-retry/);
+	const second = await settle();
+	assert.equal(second.entries[0].display, false);
+});

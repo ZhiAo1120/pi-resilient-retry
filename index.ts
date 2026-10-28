@@ -43,6 +43,14 @@ const DEFAULTS: RetryConfig = {
 const CONTINUATION = "The previous provider request failed. Repeat it unchanged. Do not answer the user, do not call tools, do not explain the failure.";
 
 /**
+ * Shown instead of CONTINUATION on the first retry of a burst. Percho ignores the extension
+ * notify/status channels, so the transcript is the only place a retry is attributable — one
+ * visible line per burst, not one per attempt.
+ */
+const CONTINUATION_VISIBLE =
+	"↻ pi-resilient-retry：上游请求失败，自动重试中。Repeat the previous request unchanged; do not answer the user, do not call tools.";
+
+/**
  * Quota and billing errors. Retrying usually cannot fix them, so they are opt-in.
  * Kept in sync with pi-coding-agent's NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.
  */
@@ -271,9 +279,19 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 
 		// History stays byte-identical unless the upstream said the ids are unusable.
 		repairArmed = deadSession;
+		// The first retry of a burst is written as a visible transcript line so the retry is
+		// attributable in clients that ignore notify/setStatus; later attempts stay hidden.
+		const visible = consecutive === 1;
 		return {
 			continue: true,
-			entries: [{ type: "custom_message" as const, customType: "resilient-retry", content: CONTINUATION, display: false }],
+			entries: [
+				{
+					type: "custom_message" as const,
+					customType: "resilient-retry",
+					content: visible ? CONTINUATION_VISIBLE : CONTINUATION,
+					display: visible,
+				},
+			],
 		};
 	});
 

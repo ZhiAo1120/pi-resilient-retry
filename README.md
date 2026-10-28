@@ -117,6 +117,20 @@ the error head, whether the run was aborted, and the decision taken:
 
 No `session_start` line at all means the extension never loaded. Remove `debugLog` when done.
 
+## Why a retry may look like it came from Pi
+
+Percho ignores the extension `notify` and `setStatus` channels, so those alone leave a retry
+unattributed in its UI. To make it identifiable, the **first** retry of each burst is
+appended to the transcript as a visible line:
+
+```
+↻ pi-resilient-retry：上游请求失败，自动重试中。
+```
+
+Later attempts in the same burst stay hidden, so a long outage does not flood the
+conversation. The hidden continuation still goes to the model either way, so this costs no
+extra context.
+
 ## Visible progress
 
 A retry is never silent. While waiting you get a footer status
