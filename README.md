@@ -95,6 +95,28 @@ bodies, tool call pairs, `call_id`, `encrypted_content` and reasoning items all 
 
 Set `repairHistory: false` to disable repair entirely.
 
+## Diagnosing a silent non-retry
+
+If a failure ends the run without any retry, set a debug log to record every decision:
+
+```json
+{ "resilientRetry": { "debugLog": "/tmp/resilient-retry.log" } }
+```
+
+Each settle boundary appends one JSON line with the outcome, the assistant `stopReason`,
+the error head, whether the run was aborted, and the decision taken:
+
+```json
+{"event":"session_start","enabled":true,"config":{...}}
+{"event":"agent_before_settle","outcome":"error","stopReason":"error",
+ "error":"503: {\"message\":\"Upstream service unavailable\"}","aborted":false,
+ "hasUI":false,"decision":"retry","attempt":1,"delayMs":2000,"repair":false}
+{"event":"agent_before_settle","outcome":"error","stopReason":"error",...,
+ "decision":"skip: run aborted"}
+```
+
+No `session_start` line at all means the extension never loaded. Remove `debugLog` when done.
+
 ## Visible progress
 
 A retry is never silent. While waiting you get a footer status

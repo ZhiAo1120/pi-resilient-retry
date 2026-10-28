@@ -1,3 +1,4 @@
+import { appendFileSync } from "node:fs";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
@@ -24,6 +25,8 @@ type RetryConfig = {
 	 * the history intact so the model keeps its memory.
 	 */
 	repairHistory: boolean;
+	/** Append a JSON line per decision to this path. Diagnoses silent non-retries. */
+	debugLog?: string;
 };
 
 const DEFAULTS: RetryConfig = {
@@ -95,6 +98,7 @@ function readConfig(settings: unknown): RetryConfig {
 		maxDelayMs: num(raw?.maxDelayMs, DEFAULTS.maxDelayMs),
 		retryQuotaErrors: raw?.retryQuotaErrors === true,
 		repairHistory: raw?.repairHistory !== false,
+		debugLog: typeof raw?.debugLog === "string" && raw.debugLog ? raw.debugLog : undefined,
 	};
 }
 
@@ -155,6 +159,16 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 
 	const STATUS_KEY = "resilient-retry";
 
+	/** Records why a decision was taken; silent non-retries are otherwise unexplainable. */
+	const debug = (entry: Record<string, unknown>) => {
+		if (!config.debugLog) return;
+		try {
+			appendFileSync(config.debugLog, `${JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...entry })}\n`);
+		} catch {
+			// A debug sink must never break a run.
+		}
+	};
+
 	const clearUi = (ctx: { hasUI: boolean; ui: { setStatus: (key: string, text: string | undefined) => void } }) => {
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 	};
@@ -166,6 +180,7 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		config = readConfig(settings);
 		consecutive = 0;
 		cancelled = false;
+		debug({ event: "session_start", enabled, config: { ...config, debugLog: config.debugLog } });
 	});
 
 	// A retry in flight must not swallow the user's Escape or /stop.
@@ -182,21 +197,39 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		const result = repairPayload(event.payload);
 		if (!result) return undefined;
 		repairedTotal += result.removed;
+		debug({ event: "history_repaired", removed: result.removed });
 		return result.payload;
 	});
 
 	pi.on("agent_before_settle", async (event, ctx) => {
-		if (!enabled || event.outcome !== "error") return undefined;
-		// An explicit abort (Escape, /stop) is a user decision, never a retry.
-		if (ctx.signal?.aborted) return undefined;
-
 		const messages = event.context.contextMessages as { role: string; stopReason?: string; errorMessage?: string }[];
 		const last = [...messages].reverse().find(message => message.role === "assistant");
+		const seen = {
+			event: "agent_before_settle",
+			outcome: event.outcome,
+			stopReason: last?.stopReason,
+			error: (last?.errorMessage ?? "").slice(0, 160),
+			aborted: ctx.signal?.aborted === true,
+			hasUI: ctx.hasUI,
+			enabled,
+		};
+
+		if (!enabled || event.outcome !== "error") {
+			debug({ ...seen, decision: "skip: not an error outcome" });
+			return undefined;
+		}
+		// An explicit abort (Escape, /stop) is a user decision, never a retry.
+		if (ctx.signal?.aborted) {
+			debug({ ...seen, decision: "skip: run aborted" });
+			return undefined;
+		}
 		if (last?.stopReason !== "error" || !shouldRetry(last.errorMessage, config)) {
+			debug({ ...seen, decision: "skip: policy declined" });
 			clearUi(ctx);
 			return undefined;
 		}
 		if (config.maxRetries > 0 && consecutive >= config.maxRetries) {
+			debug({ ...seen, decision: "skip: budget exhausted", consecutive });
 			clearUi(ctx);
 			if (ctx.hasUI) ctx.ui.notify(`上游连续失败 ${consecutive} 次，已停止重试。${last.errorMessage?.slice(0, 200) ?? ""}`, "error");
 			return undefined;
@@ -207,6 +240,7 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		const budget = config.maxRetries > 0 ? `/${config.maxRetries}` : "";
 		// Only a reported dead session justifies trading memory for a replayable history.
 		const deadSession = config.repairHistory && sessionIdsAreDead(last.errorMessage);
+		debug({ ...seen, decision: "retry", attempt: consecutive, delayMs: delay, repair: deadSession });
 
 		// A footer status is always visible and survives the wait, unlike a notification.
 		if (ctx.hasUI) {
@@ -230,6 +264,7 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		}
 		wake = undefined;
 		if (cancelled || ctx.signal?.aborted) {
+			debug({ event: "retry_cancelled", attempt: consecutive, cancelled, aborted: ctx.signal?.aborted === true });
 			clearUi(ctx);
 			return undefined;
 		}

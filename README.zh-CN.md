@@ -95,6 +95,28 @@ pi install /path/to/pi-resilient-retry
 
 `maxRetries` 在任何成功请求后重置，因此它限制的是单次故障，而非整个会话。
 
+## 排查「没有重试」的原因
+
+如果失败直接结束了运行、看不到任何重试，设一个调试日志把每次决策记录下来：
+
+```json
+{ "resilientRetry": { "debugLog": "/tmp/resilient-retry.log" } }
+```
+
+每个 settle 边界会追加一行 JSON，包含 outcome、助手消息的 `stopReason`、错误开头、
+运行是否被中止，以及最终决策：
+
+```json
+{"event":"session_start","enabled":true,"config":{...}}
+{"event":"agent_before_settle","outcome":"error","stopReason":"error",
+ "error":"503: {\"message\":\"Upstream service unavailable\"}","aborted":false,
+ "hasUI":false,"decision":"retry","attempt":1,"delayMs":2000,"repair":false}
+{"event":"agent_before_settle","outcome":"error","stopReason":"error",...,
+ "decision":"skip: run aborted"}
+```
+
+**完全没有 `session_start` 行，说明扩展根本没被加载。** 排查完记得删掉 `debugLog`。
+
 ## 可见进度
 
 重试**从不静默**。等待期间底部状态栏常驻显示：
