@@ -13,22 +13,22 @@ install [pi-retry](https://github.com/ZhiAo1120/pi-retry) alongside it:
 |---|---|---|
 | Trigger | Automatic, retries on failure | You type `/retry` |
 | Job | Retry in the background so the task is not interrupted | Resume from the checkpoint without replaying finished work |
-| Budget | Unlimited (configurable) | 3 failed requests, then it stops with a reason |
+| Budget | Unlimited, with a repeat guard | 3 failed requests, then it stops with a reason |
 | History repair | Drops ids only when the upstream reports the ids are dead | `/retry` drops ids; `--deep` also drops reasoning |
 
-The lifecycle hooks do not conflict, so both can be installed. One keeps the task
-alive; the other makes your manual intervention precise. They complement rather than
-replace each other.
+The lifecycle hooks do not conflict, so both can be installed. One keeps the task alive; the
+other makes your manual intervention precise.
+
+## The problem
 
 Pi already retries transient provider errors — overloaded, 429, 5xx, timeouts, dropped
-streams — up to `retry.maxRetries`. Everything else ends the run immediately. That is
-the usual reason a flaky routing proxy kills a long task: a `400` from the upstream, an
-unmapped message like `upstream sent an error event`, or quota wording Pi treats as
-fatal.
+streams — up to `retry.maxRetries`. Everything else ends the run immediately. That is the
+usual reason a flaky routing proxy kills a long task: a `400` from the upstream, an unmapped
+message like `upstream sent an error event`, or a relay-specific rejection.
 
-This extension adds a second layer at `agent_before_settle`, the last boundary in Pi
-that can force one more model request. When the run ended on a retryable error and the
-user did not abort, it waits out a backoff delay and continues the run.
+This extension hooks `agent_before_settle`, the last boundary in Pi that can force one more
+model request. When a run ends on a retryable error and the user did not abort, it waits out a
+backoff delay and continues the run.
 
 ## Install
 
@@ -38,15 +38,11 @@ pi install git:github.com/ZhiAo1120/pi-resilient-retry
 pi install /path/to/pi-resilient-retry
 ```
 
-Restart Pi or run `/reload`. The extension loads on its own; no `/retry` command and no
-per-session setup.
+Restart Pi or run `/reload`. The extension loads on its own; no per-session setup.
 
 ## Settings
 
-Optional. The default budget is unlimited, because a relay routes each attempt to a
-different upstream and a finite budget can give up on a node that would have worked.
-History repair keeps retries from replaying the identical failing payload, and the status
-line plus Escape bound what an outage costs you.
+All optional.
 
 ```json
 {
@@ -55,7 +51,10 @@ line plus Escape bound what an outage costs you.
     "maxRetries": 0,
     "baseDelayMs": 2000,
     "maxDelayMs": 60000,
-    "retryQuotaErrors": false
+    "repeatLimit": 30,
+    "visibleRetry": "first",
+    "retryQuotaErrors": false,
+    "repairHistory": true
   }
 }
 ```
@@ -63,24 +62,44 @@ line plus Escape bound what an outage costs you.
 | Setting | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Turn the extension off without uninstalling it. |
-| `maxRetries` | `0` | Consecutive retries allowed without a successful request. `0` = unlimited; set a number to cap one outage. |
+| `maxRetries` | `0` | Consecutive retries allowed without a successful request. `0` = unlimited. |
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
-| `retryQuotaErrors` | `false` | Also retry quota/billing errors, which retrying usually cannot fix. |
-| `repairHistory` | `true` | Allow dropping replay-only history ids, only when the upstream reports the session ids are unusable. |
+| `repeatLimit` | `30` | Attempts allowed for one **unchanged** error. `0` disables the guard. |
+| `visibleRetry` | `"first"` | When a retry is written into the conversation: `"first"`, `"always"`, `"never"`. |
+| `retryQuotaErrors` | `false` | Also retry quota/billing errors. |
+| `repairHistory` | `true` | Allow dropping replay-only history ids, only when the upstream says the ids are dead. |
 
-`maxRetries` resets after any successful request, so it bounds one outage, not the whole
-session.
+`maxRetries` and `repeatLimit` reset after any successful request, so they bound one outage,
+not the whole session.
 
-## History repair is gated
+## Context cost
 
-Retrying the identical payload can fail forever when a relay answers with an upstream node
-that refuses the previous node's history (`The requested item was created under a different
-Azure OpenAI resource`). Dropping the history item ids makes the conversation replayable by
-any node — but it also costs the model its cross-turn memory, so it is **not** done for
-every retry.
+Retries do not have to pollute the conversation.
 
-Repair runs only when the upstream explicitly reports that the session's ids are unusable:
+| `visibleRetry` | Behaviour | Cost |
+|---|---|---|
+| `"first"` | Only the first retry of each outage is written | One short message (~50 tokens) per outage |
+| `"always"` | Every attempt is written | Grows linearly with attempts |
+| `"never"` | Nothing is written | **Zero**, and context gets shorter |
+
+Silent retries do not append a message. They use `context_edit` to drop the failed assistant
+message from model context, so the continuation runs from the last user turn.
+
+Measured on one outage with four consecutive failures:
+
+```
+visibleRetry = "never"  →  5788B, 5788B, 5788B, 5788B, 5788B   (constant)
+visibleRetry = "first"  →  5788B, 5964B, 5964B, 5964B, 5964B   (one message, then constant)
+```
+
+## Why a retry is not just the same request again
+
+A relay answers each attempt with whichever upstream node it picks. Replaying the exact same
+payload can therefore fail forever: history items minted by node A carry ids that node B
+refuses to resolve (`The requested item was created under a different Azure OpenAI resource`).
+
+Repair runs only when the upstream explicitly reports that the session ids are unusable:
 
 | Trigger | |
 |---|---|
@@ -88,23 +107,46 @@ Repair runs only when the upstream explicitly reports that the session's ids are
 | `belongs to a different upstream account` | Same class of replay rejection. |
 | `previous_response_id` / `item` / `session` … `not found` \| `expired` \| `invalid` | The id no longer resolves. |
 
-Every other failure — a plain 400, a 429, a 503, a dropped stream — retries with the
-history **byte-identical**, so the model keeps its memory and the prompt-cache prefix stays
-intact. When repair does run, only the optional `id` of complete items is dropped; message
-bodies, tool call pairs, `call_id`, `encrypted_content` and reasoning items all survive.
+Every other failure retries with the history **byte-identical**, so the model keeps its memory
+and the prompt-cache prefix stays intact. When repair does run, only the optional `id` of
+complete items is dropped; message bodies, tool call pairs, `call_id`, `encrypted_content` and
+every reasoning item survive. Repair is armed for one request only.
 
-Set `repairHistory: false` to disable repair entirely.
+Set `repairHistory: false` to send retries byte-identical instead.
+
+## Seeing that a retry happened
+
+Percho renders none of Pi's extension UI channels (`notify`, `setStatus`, `custom_message`),
+so the conversation is the only place a retry can be attributed. With `visibleRetry: "first"`
+the first retry of an outage appears as:
+
+```
+↻ pi-resilient-retry：上游请求失败，自动重试中（第 1 次）。
+```
+
+In a terminal Pi session the footer also shows live progress
+(`⏳ 上游报错，重试第 3/30 次 · 等待 12s · Esc 取消`). Escape, `/stop`, or closing the session
+cancels the wait within a quarter second.
+
+## Stopping an impossible loop
+
+Unlimited retries are only safe while the failure keeps changing. When the **same** error
+repeats with no successful request in between, repeating it cannot help, so the extension
+stops and reports it.
+
+A different error each attempt (a relay rotating nodes) keeps retrying without limit; an
+identical error thirty-one times in a row does not.
 
 ## Diagnosing a silent non-retry
 
-If a failure ends the run without any retry, set a debug log to record every decision:
+Set a debug log to record every decision:
 
 ```json
 { "resilientRetry": { "debugLog": "/tmp/resilient-retry.log" } }
 ```
 
-Each settle boundary appends one JSON line with the outcome, the assistant `stopReason`,
-the error head, whether the run was aborted, and the decision taken:
+Each settle boundary appends one JSON line with the outcome, the assistant `stopReason`, the
+error head, whether the run was aborted, and the decision taken:
 
 ```json
 {"event":"session_start","enabled":true,"config":{...}}
@@ -117,83 +159,19 @@ the error head, whether the run was aborted, and the decision taken:
 
 No `session_start` line at all means the extension never loaded. Remove `debugLog` when done.
 
-## Why a retry may look like it came from Pi
-
-Percho ignores the extension `notify` and `setStatus` channels, so those alone leave a retry
-unattributed in its UI. To make it identifiable, the **first** retry of each burst is
-appended to the transcript as a visible line:
-
-```
-↻ pi-resilient-retry：上游请求失败，自动重试中。
-```
-
-Later attempts in the same burst stay hidden, so a long outage does not flood the
-conversation. The hidden continuation still goes to the model either way, so this costs no
-extra context.
-
-## 重试是否污染上下文
-
-**默认几乎不污染。** 重试有两种写入方式，按次数自动选择：
-
-| 配置项 | 默认值 | 行为 |
-|---|---|---|
-| `visibleRetry` | `"first"` | 每轮故障**只有第一次**重试写一条可见消息；后续重试零写入 |
-| `visibleRetry` | `"always"` | 每次重试都写（最吵，上下文随次数增长） |
-| `visibleRetry` | `"never"` | 完全不写，上下文零增长，但界面上看不到重试 |
-
-静默重试不新增任何消息，而是用 `context_edit` 把**失败的那次助手消息从模型上下文里删除**，
-让续跑从最后一条用户消息重新开始。因此静默重试不但不增加 token，反而让上下文更短。
-
-实测（同一个故障连续 4 次失败后恢复）：
-
-```
-visibleRetry = "never"   → 每次请求载荷恒定 5788B（零增长）
-visibleRetry = "first"   → 5788B → 5964B（只加一条，之后恒定）
-```
-
-代价对比：`first` 每轮故障多约 176 字节（约 50 token），`never` 为 0。
-
-如果你完全不需要在界面看到重试，设 `"never"` 最省。需要观察时保留 `"first"`。
-
-## Visible progress
-
-A retry is never silent. While waiting you get a footer status
-(`⏳ 上游报错，重试第 3/20 次 · 等待 12s · Esc 取消`), the working message shows the same,
-and recovery or exhaustion is reported in the transcript. Escape, `/stop`, or closing the
-session cancels the wait within a quarter second.
-
-## Stopping an impossible loop
-
-Unlimited retries are only safe while the failure keeps changing. When the **same** error
-repeats with no successful request in between, repeating it cannot help, so the extension
-stops and reports it.
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `repeatLimit` | `30` | Consecutive attempts allowed for one unchanged error. `0` disables the guard. |
-
-A different error each attempt (a relay rotating nodes) keeps retrying without limit; an
-identical error eleven times in a row does not. Any successful request resets the counter.
-
 ## What it does not do
 
-- **No tool replay.** The retry repeats the failed model request only; it never re-runs a
-  tool. A request that already executed tools keeps their results.
+- **No tool replay.** A retry repeats the failed model request only; it never re-runs a tool.
 - **No abort override.** Escape, `/stop`, and a cancelled run are never retried.
-- **No quota guessing.** Billing and quota errors are excluded by default because
-  repeating them just burns time. Turn on `retryQuotaErrors` if your proxy reports
-  temporary quota as a quota error.
-- **No error-text filtering for retries.** A relay fronts many upstreams, so a rejection
-  from one node says nothing about the next. Every failure gets another attempt. Error text
-  is read for one thing only: deciding whether the session ids are dead. Only quota/billing
-  wording is opt-in.
+- **No error-text filtering for retries.** A relay fronts many upstreams, so a rejection from
+  one node says nothing about the next. Every failure gets another attempt; the text is read
+  only to decide whether the session ids are dead.
 
 ## Relationship to Pi's built-in retry
 
-Both layers run. Pi's retry handles the transient errors it recognises first; this
-extension catches whatever Pi refuses. Keeping Pi's own settings intact is intentional —
-it keeps Pi's quota detection working, which the extension relies on for its default
-policy.
+Both layers run. Pi's retry handles the transient errors it recognises first; this extension
+catches whatever Pi refuses. Keeping Pi's own settings intact preserves its quota detection,
+which this extension relies on for its default policy.
 
 ## Development
 
@@ -203,10 +181,10 @@ npm test     # policy unit tests, no network
 npm run check
 ```
 
-The end-to-end behaviour was verified against a fake upstream: with Pi's own retry
-disabled (`retry.maxRetries: 0`), three consecutive `400` responses followed by a `200`
-recovered normally, and a quota error with `retryQuotaErrors: false` stopped after one
-request.
+Verified end to end against fake upstreams: consecutive `400`s recover after retry; a quota
+error with `retryQuotaErrors: false` stops after one request; a transient 503 keeps history ids
+intact; a cross-resource rejection recovers after ids are stripped; an unchanged error stops at
+`repeatLimit`; silent retries keep the request payload constant.
 
 ## License
 
