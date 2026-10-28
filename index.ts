@@ -55,7 +55,7 @@ const DEFAULTS: RetryConfig = {
 	retryQuotaErrors: false,
 	repairHistory: true,
 	repeatLimit: 30,
-	visibleRetry: true,
+	visibleRetry: false,
 	noticeEvery: 1,
 };
 
@@ -160,7 +160,9 @@ function readConfig(settings: unknown): RetryConfig {
 		repairHistory: raw?.repairHistory !== false,
 		repeatLimit: num(raw?.repeatLimit, DEFAULTS.repeatLimit),
 		// Accepts the legacy "first"/"always"/"never" strings too.
-		visibleRetry: (raw?.visibleRetry as unknown) === false || (raw?.visibleRetry as unknown) === "never" ? false : DEFAULTS.visibleRetry,
+		visibleRetry: raw?.visibleRetry === undefined
+			? DEFAULTS.visibleRetry
+			: !((raw.visibleRetry as unknown) === false || (raw.visibleRetry as unknown) === "never"),
 		noticeEvery: Math.max(1, Math.floor(num(raw?.noticeEvery, DEFAULTS.noticeEvery))),
 		debugLog: typeof raw?.debugLog === "string" && raw.debugLog ? raw.debugLog : undefined,
 	};
@@ -362,25 +364,8 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		// History stays byte-identical unless the upstream said the ids are unusable.
 		repairArmed = deadSession;
 
-		// Printing is the only way to be visible in clients that ignore extension UI, but every
-		// printed line stays in the session forever, so allow thinning it out.
-		const printThis = config.visibleRetry && (consecutive === 1 || consecutive % config.noticeEvery === 0);
-		if (printThis) {
-			// One real user message makes the retry visible; Percho renders neither notify,
-			// setStatus nor custom_message. Cost is one short message per outage.
-			const notice = `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}。Repeat the previous request unchanged; do not answer the user, do not call tools.`;
-			try {
-				await pi.sendUserMessage(notice, { deliverAs: "followUp" });
-			} catch (error) {
-				debug({ event: "retry_send_failed", attempt: consecutive, error: String(error).slice(0, 120) });
-				clearUi(ctx);
-			}
-			return undefined;
-		}
-
-		// Silent retry: drop the failed attempt from model context instead of appending anything.
-		// The continuation then runs from the last user turn, so a retry adds no tokens and the
-		// conversation does not grow with each attempt.
+		// Silent retry: drop the failed attempt from model context and continue the run. No message
+		// is sent, because a retry is the system re-invoking the model, not the user speaking.
 		const failed = [...event.context.contextEntries]
 			.reverse()
 			.find(entry => entry.messages.includes(last as never));
@@ -389,10 +374,21 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 			clearUi(ctx);
 			return undefined;
 		}
-		return {
-			continue: true,
-			entries: [{ type: "context_edit" as const, targetId: failed.sourceEntry.id, replacement: null }],
-		};
+
+		const entries: Record<string, unknown>[] = [
+			{ type: "context_edit", targetId: failed.sourceEntry.id, replacement: null },
+		];
+		// Optional marker for clients that render custom entries. It never reaches the model:
+		// stripRetryNoise removes it from the payload.
+		if (config.visibleRetry && (consecutive === 1 || consecutive % config.noticeEvery === 0)) {
+			entries.push({
+				type: "custom_message",
+				customType: "resilient-retry",
+				content: `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}`,
+				display: true,
+			});
+		}
+		return { continue: true, entries: entries as never };
 	});
 
 	// Any request that is not an error means the upstream recovered.

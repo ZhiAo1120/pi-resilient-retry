@@ -49,7 +49,7 @@ pi install /path/to/pi-resilient-retry
     "baseDelayMs": 2000,
     "maxDelayMs": 60000,
     "repeatLimit": 30,
-    "visibleRetry": true,
+    "visibleRetry": false,
     "retryQuotaErrors": false,
     "repairHistory": true
   }
@@ -63,39 +63,30 @@ pi install /path/to/pi-resilient-retry
 | `baseDelayMs` | `2000` | 首次退避延迟；每次翻倍。 |
 | `maxDelayMs` | `60000` | 延迟上限，所有延迟都限制在此值内。 |
 | `repeatLimit` | `30` | 同一个**未变化**错误允许的尝试次数。`0` 关闭该保护。 |
-| `visibleRetry` | `true` | 把重试打印进对话。这些记录在发给模型前会被剥离。 |
+| `visibleRetry` | `false` | 每次重试加一条 `custom_message` 标记，发出前会被剥离。 |
 | `noticeEvery` | `1` | 每 N 次尝试打印一次；每轮的第 1 次始终打印。 |
 | `retryQuotaErrors` | `false` | 也重试额度/计费错误。 |
 | `repairHistory` | `true` | 允许移除仅用于重放的历史 id，仅当上游报告 id 失效时。 |
 
 `maxRetries` 和 `repeatLimit` 在任何一次成功请求后重置，因此限制的是单次故障，而非整个会话。
 
-## 上下文代价
+## 重试是怎么发生的
 
-重试记录是给你看的，不是给模型看的。它们会打印进对话，让你看到进度；但每次请求发出前，
-所有记录都会从载荷里删除——连同失败留下的那条空助手消息。模型收到的仍是**原始请求**：
-不增长、不丢记忆、prompt 缓存前缀稳定。
-
-实测（同一故障连续 3 次失败）：
+重试是**系统**重新调用模型，不是你发言。扩展在边界返回一个续跑指令，把失败的助手回合从上下文
+丢弃后重发请求。全程不会代替你发送任何消息：
 
 ```
-请求 #1  载荷 5787B   载荷中的重试记录：0
-请求 #4  载荷 5787B   载荷中的重试记录：0
-
-会话记录：3 条可见的 ↻ pi-resilient-retry
+会话：user "hi" → assistant（报错）→ [context omit] → assistant（报错）→ [context omit] → assistant "回答"
+请求：载荷 5787B，始终只有一条用户消息，每次完全相同
 ```
 
-### 无法删除的部分
+失败的尝试用 `context_edit` 删除，因此模型收到的仍是原始请求：不增长、不丢记忆、缓存前缀稳定。
 
-Pi 的会话是**只追加**的：`SessionManager` 明确写着条目「不能被修改或删除」。
-因此凡是界面上可见的消息，就是一条会话条目，会永久留在会话文件里。两个开关可以限制这个代价：
+### 可选标记
 
-| 配置项 | 作用 |
-|---|---|
-| `visibleRetry: false` | 完全不打印；重试走 `context_edit`，不写任何消息。 |
-| `noticeEvery: 3` | 每轮只打印第 1 次，之后每 3 次打印一次，其余静默。 |
-
-两种方式都不影响模型上下文，且 `/compact` 会把旧记录折叠成摘要。
+`visibleRetry: true` 会为每次重试加一条 `custom_message` 标记（可用 `noticeEvery` 降低频率）。
+该标记在发出前会被剥离，模型永远看不到。默认关闭，因为 Pi 会话只追加——每条标记都会永久留在
+会话文件里——而 Percho 也不渲染 custom message。
 
 ## 为什么重试不能只是「再发一遍同样的请求」
 

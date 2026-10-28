@@ -52,7 +52,7 @@ All optional.
     "baseDelayMs": 2000,
     "maxDelayMs": 60000,
     "repeatLimit": 30,
-    "visibleRetry": true,
+    "visibleRetry": false,
     "retryQuotaErrors": false,
     "repairHistory": true
   }
@@ -66,7 +66,7 @@ All optional.
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
 | `repeatLimit` | `30` | Attempts allowed for one **unchanged** error. `0` disables the guard. |
-| `visibleRetry` | `true` | Print retries into the conversation. The notices are stripped from the model payload. |
+| `visibleRetry` | `false` | Add a `custom_message` marker per retry. Stripped from the payload. |
 | `noticeEvery` | `1` | Print every Nth attempt; the first of a burst is always printed. |
 | `retryQuotaErrors` | `false` | Also retry quota/billing errors. |
 | `repairHistory` | `true` | Allow dropping replay-only history ids, only when the upstream says the ids are dead. |
@@ -74,34 +74,26 @@ All optional.
 `maxRetries` and `repeatLimit` reset after any successful request, so they bound one outage,
 not the whole session.
 
-## Context cost
+## How a retry works
 
-Retry notices are for you, not for the model. They are printed into the conversation so you can
-watch progress, and every notice is removed from the outgoing payload before the request is
-sent — including the empty assistant turn left by the failure. The model receives the original
-request unchanged: no growth, no lost memory, stable prompt-cache prefix.
-
-Measured on an outage with three consecutive failures:
+A retry is the **system** re-invoking the model, not the user speaking. The extension returns a
+boundary continuation that drops the failed assistant turn from context and re-issues the
+request. No message is ever sent on your behalf:
 
 ```
-request #1  payload 5787B   retry notices in payload: 0
-request #4  payload 5787B   retry notices in payload: 0
-
-session transcript: 3 visible ↻ pi-resilient-retry lines
+session:  user "hi" → assistant (error) → [context omit] → assistant (error) → [context omit] → assistant "answer"
+requests: payload 5787B, one user message, identical every attempt
 ```
 
-### What cannot be removed
+The failed attempt is removed with `context_edit`, so the model receives the original request
+unchanged: no growth, no lost memory, stable prompt-cache prefix.
 
-Pi sessions are **append-only**: `SessionManager` states that entries "cannot be modified or
-deleted". A message that is visible in the UI is therefore a session entry, and it stays in the
-session file. Two knobs bound that cost:
+### Optional marker
 
-| Setting | Effect |
-|---|---|
-| `visibleRetry: false` | Nothing is printed; retries use `context_edit` and write no messages. |
-| `noticeEvery: 3` | Prints the first attempt of a burst plus every third one; the rest stay silent. |
-
-Either way the model context is unaffected, and `/compact` folds old lines into a summary.
+`visibleRetry: true` adds a `custom_message` marker per retry (thinned by `noticeEvery`). The
+marker is stripped from the outgoing payload, so the model never sees it. It is off by default
+because Pi sessions are append-only — every marker stays in the session file forever — and
+Percho does not render custom messages anyway.
 
 ## Why a retry is not just the same request again
 
