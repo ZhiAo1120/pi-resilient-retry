@@ -66,7 +66,8 @@ All optional.
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
 | `repeatLimit` | `30` | Attempts allowed for one **unchanged** error. `0` disables the guard. |
-| `visibleRetry` | `true` | Print every retry into the conversation. The notices are stripped from the model payload. |
+| `visibleRetry` | `true` | Print retries into the conversation. The notices are stripped from the model payload. |
+| `noticeEvery` | `1` | Print every Nth attempt; the first of a burst is always printed. |
 | `retryQuotaErrors` | `false` | Also retry quota/billing errors. |
 | `repairHistory` | `true` | Allow dropping replay-only history ids, only when the upstream says the ids are dead. |
 
@@ -75,26 +76,32 @@ not the whole session.
 
 ## Context cost
 
-Retry notices are for you, not for the model. Every attempt is printed into the conversation
-so you can watch progress, and every notice is removed from the outgoing payload before the
-request is sent — including the empty assistant turn left by the failure.
-
-The model therefore receives the original request unchanged: no growth, no lost memory, and a
-stable prompt-cache prefix.
+Retry notices are for you, not for the model. They are printed into the conversation so you can
+watch progress, and every notice is removed from the outgoing payload before the request is
+sent — including the empty assistant turn left by the failure. The model receives the original
+request unchanged: no growth, no lost memory, stable prompt-cache prefix.
 
 Measured on an outage with three consecutive failures:
 
 ```
 request #1  payload 5787B   retry notices in payload: 0
-request #2  payload 5787B   retry notices in payload: 0
-request #3  payload 5787B   retry notices in payload: 0
 request #4  payload 5787B   retry notices in payload: 0
 
 session transcript: 3 visible ↻ pi-resilient-retry lines
 ```
 
-Set `visibleRetry: false` to stop printing them; the retry then drops the failed attempt with
-`context_edit` and writes nothing at all.
+### What cannot be removed
+
+Pi sessions are **append-only**: `SessionManager` states that entries "cannot be modified or
+deleted". A message that is visible in the UI is therefore a session entry, and it stays in the
+session file. Two knobs bound that cost:
+
+| Setting | Effect |
+|---|---|
+| `visibleRetry: false` | Nothing is printed; retries use `context_edit` and write no messages. |
+| `noticeEvery: 3` | Prints the first attempt of a burst plus every third one; the rest stay silent. |
+
+Either way the model context is unaffected, and `/compact` folds old lines into a summary.
 
 ## Why a retry is not just the same request again
 

@@ -32,10 +32,15 @@ type RetryConfig = {
 	 */
 	repeatLimit: number;
 	/**
-	 * Print every retry into the conversation so it is visible in the UI. The notices are
+	 * Print retries into the conversation so they are visible in the UI. The notices are
 	 * stripped from the outgoing payload, so the model never pays for them.
+	 *
+	 * Note: Pi sessions are append-only — entries cannot be deleted afterwards. Printing every
+	 * attempt therefore grows the session file, though never the model context.
 	 */
 	visibleRetry: boolean;
+	/** Print every Nth attempt (the first of a burst is always printed). `1` = every attempt. */
+	noticeEvery: number;
 	/** Append a JSON line per decision to this path. Diagnoses silent non-retries. */
 	debugLog?: string;
 };
@@ -51,6 +56,7 @@ const DEFAULTS: RetryConfig = {
 	repairHistory: true,
 	repeatLimit: 30,
 	visibleRetry: true,
+	noticeEvery: 1,
 };
 
 /**
@@ -155,6 +161,7 @@ function readConfig(settings: unknown): RetryConfig {
 		repeatLimit: num(raw?.repeatLimit, DEFAULTS.repeatLimit),
 		// Accepts the legacy "first"/"always"/"never" strings too.
 		visibleRetry: (raw?.visibleRetry as unknown) === false || (raw?.visibleRetry as unknown) === "never" ? false : DEFAULTS.visibleRetry,
+		noticeEvery: Math.max(1, Math.floor(num(raw?.noticeEvery, DEFAULTS.noticeEvery))),
 		debugLog: typeof raw?.debugLog === "string" && raw.debugLog ? raw.debugLog : undefined,
 	};
 }
@@ -355,7 +362,10 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		// History stays byte-identical unless the upstream said the ids are unusable.
 		repairArmed = deadSession;
 
-		if (config.visibleRetry) {
+		// Printing is the only way to be visible in clients that ignore extension UI, but every
+		// printed line stays in the session forever, so allow thinning it out.
+		const printThis = config.visibleRetry && (consecutive === 1 || consecutive % config.noticeEvery === 0);
+		if (printThis) {
 			// One real user message makes the retry visible; Percho renders neither notify,
 			// setStatus nor custom_message. Cost is one short message per outage.
 			const notice = `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}。Repeat the previous request unchanged; do not answer the user, do not call tools.`;

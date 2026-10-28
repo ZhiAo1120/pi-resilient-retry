@@ -371,3 +371,25 @@ test("the default repeat limit allows 30 attempts of one unchanged error", async
 	for (let i = 0; i < 40; i++) await h.settle("400: same failure");
 	assert.equal(h.attemptedCount, 30);
 });
+
+test("noticeEvery thins out printed retries but keeps the first", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, noticeEvery: 3 } });
+	await h.start();
+	for (let i = 0; i < 6; i++) await h.settle(`503: attempt ${i}`);
+	assert.equal(h.attemptedCount, 6);
+	// Printed: attempt 1, then 3 and 6.
+	assert.equal(h.sent.length, 3);
+	assert.match(h.sent[0].content, /第 1 次/);
+	assert.match(h.sent[1].content, /第 3 次/);
+	assert.match(h.sent[2].content, /第 6 次/);
+});
+
+test("unprinted retries still continue without touching context", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, noticeEvery: 5 } });
+	await h.start();
+	await h.settle("503: first");
+	const second = await h.settle("503: second");
+	assert.equal(second.result.continue, true);
+	assert.equal(second.result.entries[0].type, "context_edit");
+	assert.equal(h.sent.length, 1);
+});
