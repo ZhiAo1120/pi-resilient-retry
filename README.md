@@ -52,7 +52,7 @@ All optional.
     "baseDelayMs": 2000,
     "maxDelayMs": 60000,
     "repeatLimit": 30,
-    "visibleRetry": "first",
+    "visibleRetry": true,
     "retryQuotaErrors": false,
     "repairHistory": true
   }
