@@ -66,7 +66,7 @@ All optional.
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
 | `repeatLimit` | `30` | Attempts allowed for one **unchanged** error. `0` disables the guard. |
-| `visibleRetry` | `"first"` | When a retry is written into the conversation: `"first"`, `"always"`, `"never"`. |
+| `visibleRetry` | `true` | Print every retry into the conversation. The notices are stripped from the model payload. |
 | `retryQuotaErrors` | `false` | Also retry quota/billing errors. |
 | `repairHistory` | `true` | Allow dropping replay-only history ids, only when the upstream says the ids are dead. |
 
@@ -75,23 +75,26 @@ not the whole session.
 
 ## Context cost
 
-Retries do not have to pollute the conversation.
+Retry notices are for you, not for the model. Every attempt is printed into the conversation
+so you can watch progress, and every notice is removed from the outgoing payload before the
+request is sent — including the empty assistant turn left by the failure.
 
-| `visibleRetry` | Behaviour | Cost |
-|---|---|---|
-| `"first"` | Only the first retry of each outage is written | One short message (~50 tokens) per outage |
-| `"always"` | Every attempt is written | Grows linearly with attempts |
-| `"never"` | Nothing is written | **Zero**, and context gets shorter |
+The model therefore receives the original request unchanged: no growth, no lost memory, and a
+stable prompt-cache prefix.
 
-Silent retries do not append a message. They use `context_edit` to drop the failed assistant
-message from model context, so the continuation runs from the last user turn.
-
-Measured on one outage with four consecutive failures:
+Measured on an outage with three consecutive failures:
 
 ```
-visibleRetry = "never"  →  5788B, 5788B, 5788B, 5788B, 5788B   (constant)
-visibleRetry = "first"  →  5788B, 5964B, 5964B, 5964B, 5964B   (one message, then constant)
+request #1  payload 5787B   retry notices in payload: 0
+request #2  payload 5787B   retry notices in payload: 0
+request #3  payload 5787B   retry notices in payload: 0
+request #4  payload 5787B   retry notices in payload: 0
+
+session transcript: 3 visible ↻ pi-resilient-retry lines
 ```
+
+Set `visibleRetry: false` to stop printing them; the retry then drops the failed attempt with
+`context_edit` and writes nothing at all.
 
 ## Why a retry is not just the same request again
 
@@ -117,8 +120,7 @@ Set `repairHistory: false` to send retries byte-identical instead.
 ## Seeing that a retry happened
 
 Percho renders none of Pi's extension UI channels (`notify`, `setStatus`, `custom_message`),
-so the conversation is the only place a retry can be attributed. With `visibleRetry: "first"`
-the first retry of an outage appears as:
+so the conversation is the only place a retry can be attributed. Every retry appears as:
 
 ```
 ↻ pi-resilient-retry：上游请求失败，自动重试中（第 1 次）。

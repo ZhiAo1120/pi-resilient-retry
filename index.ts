@@ -32,10 +32,10 @@ type RetryConfig = {
 	 */
 	repeatLimit: number;
 	/**
-	 * When a retry is written into the conversation so it is visible in the UI.
-	 * `first` costs one short message per outage; `never` leaves the context untouched.
+	 * Print every retry into the conversation so it is visible in the UI. The notices are
+	 * stripped from the outgoing payload, so the model never pays for them.
 	 */
-	visibleRetry: "first" | "always" | "never";
+	visibleRetry: boolean;
 	/** Append a JSON line per decision to this path. Diagnoses silent non-retries. */
 	debugLog?: string;
 };
@@ -50,7 +50,7 @@ const DEFAULTS: RetryConfig = {
 	retryQuotaErrors: false,
 	repairHistory: true,
 	repeatLimit: 30,
-	visibleRetry: "first",
+	visibleRetry: true,
 };
 
 /**
@@ -99,6 +99,49 @@ function shouldRetry(error: string | undefined, config: RetryConfig): boolean {
 	return true;
 }
 
+const RETRY_MARKER = "pi-resilient-retry";
+
+/** True for an assistant turn that produced nothing — the failed attempt being retried. */
+function isFailedAttempt(item: Record<string, unknown>): boolean {
+	if (item.role !== "assistant") return false;
+	const content = item.content;
+	if (Array.isArray(content)) return content.length === 0;
+	return content === "" || content === undefined;
+}
+
+function isRetryNotice(item: Record<string, unknown>): boolean {
+	if (typeof item.content === "string") return item.content.includes(RETRY_MARKER);
+	return JSON.stringify(item.content ?? "").includes(RETRY_MARKER);
+}
+
+/**
+ * Remove retry notices and the failed attempt from the outgoing payload. The notices stay in
+ * the session so the UI can show them, but the model never sees them: the request it receives
+ * is the original one, which also keeps the prompt-cache prefix stable.
+ */
+function stripRetryNoise(payload: unknown): { payload: unknown; removed: number } | undefined {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
+	const body = payload as Record<string, unknown>;
+	let removed = 0;
+	const filter = (list: unknown): unknown[] | undefined => {
+		if (!Array.isArray(list)) return undefined;
+		return list.filter(entry => {
+			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return true;
+			const item = entry as Record<string, unknown>;
+			if (!isRetryNotice(item) && !isFailedAttempt(item)) return true;
+			removed++;
+			return false;
+		});
+	};
+	const messages = filter(body.messages);
+	const input = filter(body.input);
+	if (!messages && !input) return undefined;
+	const next = { ...body };
+	if (messages) next.messages = messages;
+	if (input) next.input = input;
+	return removed > 0 ? { payload: next, removed } : undefined;
+}
+
 function readConfig(settings: unknown): RetryConfig {
 	const raw = (settings as { resilientRetry?: Partial<RetryConfig> } | undefined)?.resilientRetry;
 	const num = (value: unknown, fallback: number) =>
@@ -110,7 +153,8 @@ function readConfig(settings: unknown): RetryConfig {
 		retryQuotaErrors: raw?.retryQuotaErrors === true,
 		repairHistory: raw?.repairHistory !== false,
 		repeatLimit: num(raw?.repeatLimit, DEFAULTS.repeatLimit),
-		visibleRetry: raw?.visibleRetry === "always" || raw?.visibleRetry === "never" ? raw.visibleRetry : DEFAULTS.visibleRetry,
+		// Accepts the legacy "first"/"always"/"never" strings too.
+		visibleRetry: (raw?.visibleRetry as unknown) === false || (raw?.visibleRetry as unknown) === "never" ? false : DEFAULTS.visibleRetry,
 		debugLog: typeof raw?.debugLog === "string" && raw.debugLog ? raw.debugLog : undefined,
 	};
 }
@@ -209,13 +253,21 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	// Repair only the request this extension retried, so ordinary requests keep their exact
 	// history and prompt-cache prefix. Disarmed as soon as one request has been repaired.
 	pi.on("before_provider_request", (event) => {
-		if (!repairArmed || !config.repairHistory) return undefined;
-		repairArmed = false;
-		const result = repairPayload(event.payload);
-		if (!result) return undefined;
-		repairedTotal += result.removed;
-		debug({ event: "history_repaired", removed: result.removed });
-		return result.payload;
+		// Notices are printed for the user but never reach the model.
+		const stripped = stripRetryNoise(event.payload);
+		let payload = stripped ? stripped.payload : event.payload;
+		if (stripped) debug({ event: "retry_log_stripped", removed: stripped.removed });
+
+		if (repairArmed && config.repairHistory) {
+			repairArmed = false;
+			const repaired = repairPayload(payload);
+			if (repaired) {
+				repairedTotal += repaired.removed;
+				payload = repaired.payload;
+				debug({ event: "history_repaired", removed: repaired.removed });
+			}
+		}
+		return stripped || payload !== event.payload ? payload : undefined;
 	});
 
 	pi.on("agent_before_settle", async (event, ctx) => {
@@ -303,8 +355,7 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		// History stays byte-identical unless the upstream said the ids are unusable.
 		repairArmed = deadSession;
 
-		const visible = config.visibleRetry === "always" || (config.visibleRetry === "first" && consecutive === 1);
-		if (visible) {
+		if (config.visibleRetry) {
 			// One real user message makes the retry visible; Percho renders neither notify,
 			// setStatus nor custom_message. Cost is one short message per outage.
 			const notice = `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}。Repeat the previous request unchanged; do not answer the user, do not call tools.`;

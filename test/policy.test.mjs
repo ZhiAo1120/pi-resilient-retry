@@ -261,18 +261,59 @@ test("ordinary requests are never repaired", async () => {
 	assert.equal(handlers.get("before_provider_request")({ type: "before_provider_request", payload }), undefined);
 });
 
-test("by default only the first retry of a burst is visible", async () => {
+test("every retry is printed so the UI can show progress", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
 	await h.start();
 	await h.settle("503: unavailable");
 	await h.settle("503: unavailable");
 	await h.settle("503: unavailable");
-	assert.equal(h.attemptedCount, 3);
-	assert.equal(h.sent.length, 1, "later retries must not add context");
+	assert.equal(h.sent.length, 3);
 	assert.match(h.sent[0].content, /pi-resilient-retry/);
-	assert.match(h.sent[0].content, /第 1 次/);
+	assert.match(h.sent[2].content, /第 3 次/);
 	assert.equal(h.sent[0].options.deliverAs, "followUp");
 });
+
+test("the retry log never reaches the model", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1 } });
+	await h.start();
+	await h.settle("503: unavailable");
+	const payload = {
+		messages: [
+			{ role: "user", content: "hi" },
+			{ role: "assistant", content: [] },
+			{ role: "user", content: h.sent[0].content },
+		],
+	};
+	const out = h.fire("before_provider_request", { type: "before_provider_request", payload });
+	assert.deepEqual(out.messages, [{ role: "user", content: "hi" }]);
+});
+
+test("visibleRetry: false retries silently via context_edit", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: false } });
+	await h.start();
+	const first = await h.settle("503: unavailable");
+	assert.equal(first.result.continue, true);
+	assert.deepEqual(first.result.entries, [{ type: "context_edit", targetId: "e-assistant", replacement: null }]);
+	assert.equal(h.sent.length, 0, "silent mode must not add messages");
+});
+
+test("the legacy \"never\" value still means silent", async () => {
+	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: "never" } });
+	await h.start();
+	await h.settle("503: unavailable");
+	assert.equal(h.sent.length, 0);
+});
+
+test("ordinary requests are never repaired", async () => {
+	const handlers = new Map();
+	const pi = { on: (n, h) => handlers.set(n, h), getSettings: () => ({}) };
+	register(pi);
+	handlers.get("session_start")({}, { hasUI: false, ui: {} });
+	const payload = { input: [{ type: "message", role: "user", id: "msg_abc", content: "hi" }] };
+	assert.equal(handlers.get("before_provider_request")({ type: "before_provider_request", payload }), undefined);
+});
+
+
 
 test("silent retries drop the failed attempt from model context", async () => {
 	const h = harness({ resilientRetry: { baseDelayMs: 1, maxDelayMs: 1, visibleRetry: "never" } });
