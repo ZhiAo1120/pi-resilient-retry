@@ -1,405 +1,195 @@
-import { appendFileSync } from "node:fs";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { readConfig, RetryBudget, waitForRetry, repairPayload, writeRetryLog } from "./retry-core.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 /**
- * Keeps retrying a failed provider request that Pi's built-in retry refuses to retry.
- *
- * Pi retries only errors matching its retryable pattern and skips quota/billing errors.
- * Everything else — 400s, unmapped upstream errors, quota wording — ends the run.
- * This extension hooks `agent_before_settle`, the last boundary that can force one more
- * model request, and continues the run with a hidden custom message.
+ * Keeps retrying provider failures that Pi's built-in retry gives up on.
+ * `agent_before_settle` requests a context-only continuation; backoff runs after
+ * native agent/turn start, so Pi and SDK clients show real activity while waiting.
  */
-
-type RetryConfig = {
-	/** Cap on consecutive retries without a successful request. 0 disables the cap. */
-	maxRetries: number;
-	/** First backoff delay. */
-	baseDelayMs: number;
-	/** Backoff ceiling; every delay is clamped to this. */
-	maxDelayMs: number;
-	/** Also retry errors Pi classifies as quota/billing (it never retries those). */
-	retryQuotaErrors: boolean;
-	/**
-	 * Allow dropping replay-only item ids, but only after the upstream explicitly reports that
-	 * the session's items belong to a resource this node cannot resolve. Ordinary retries keep
-	 * the history intact so the model keeps its memory.
-	 */
-	repairHistory: boolean;
-	/**
-	 * Stop after this many consecutive attempts that fail with the same error and never
-	 * reach the model. Unlimited retries are only safe while the failure keeps changing;
-	 * an identical failure repeating forever means the request itself cannot succeed.
-	 */
-	repeatLimit: number;
-	/**
-	 * Print retries into the conversation so they are visible in the UI. The notices are
-	 * stripped from the outgoing payload, so the model never pays for them.
-	 *
-	 * Note: Pi sessions are append-only — entries cannot be deleted afterwards. Printing every
-	 * attempt therefore grows the session file, though never the model context.
-	 */
-	visibleRetry: boolean;
-	/** Print every Nth attempt (the first of a burst is always printed). `1` = every attempt. */
-	noticeEvery: number;
-	/** Append a JSON line per decision to this path. Diagnoses silent non-retries. */
-	debugLog?: string;
-};
-
-const DEFAULTS: RetryConfig = {
-	// Unlimited by default: a relay routes each attempt to a different upstream, so a finite
-	// budget can give up on a node that would have worked. The status line plus Escape bound
-	// the cost of an outage.
-	maxRetries: 0,
-	baseDelayMs: 2000,
-	maxDelayMs: 60000,
-	retryQuotaErrors: false,
-	repairHistory: true,
-	repeatLimit: 30,
-	visibleRetry: false,
-	noticeEvery: 1,
-};
-
-/**
- * Quota and billing errors. Retrying usually cannot fix them, so they are opt-in.
- * Kept in sync with pi-coding-agent's NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN.
- */
-const QUOTA = new RegExp([
-	"GoUsageLimitError", "FreeUsageLimitError", "Monthly usage limit reached", "available balance",
-	"insufficient_quota", "out of budget", "quota exceeded", "billing",
-	"subscription_sharing_usage_limit_exceeded", "subscription_sharing_workplace_individual_usage_limit_exceeded",
-].join("|"), "i");
-
-/**
- * The upstream explicitly says the session's history items belong to another resource or
- * account, so this node can never resolve them. Only then is dropping ids worth losing the
- * model's cross-turn memory: retrying the same ids would fail forever.
- *
- * Matched narrowly on purpose. A generic 400, a rate limit or an unmapped error says nothing
- * about id validity, and stripping ids for those would degrade every retry for no reason.
- */
-const SESSION_IDS_DEAD = [
-	/created under a different azure openai resource/i,
-	/belongs to a different upstream account/i,
-	/replayed conversation state belongs to a different/i,
-	/(?:previous_response_id|item|session)[^.]{0,40}(?:not found|does not exist|unknown|invalid|expired)/i,
-];
-
-function sessionIdsAreDead(error: string | undefined): boolean {
-	if (!error) return false;
-	return SESSION_IDS_DEAD.some(pattern => pattern.test(error));
-}
-
-function backoff(config: RetryConfig, attempt: number): number {
-	const raw = config.baseDelayMs * 2 ** Math.max(0, attempt - 1);
-	return Math.min(Number.isSafeInteger(raw) ? raw : Number.MAX_SAFE_INTEGER, config.maxDelayMs);
-}
-
-/**
- * A relay routes each attempt to a different upstream, so even a "deterministic" rejection
- * may succeed on the next node. Nothing is excluded on error text alone; the retry budget
- * is what bounds the cost.
- */
-function shouldRetry(error: string | undefined, config: RetryConfig): boolean {
-	if (!error) return false;
-	if (QUOTA.test(error)) return config.retryQuotaErrors;
-	return true;
-}
-
-const RETRY_MARKER = "pi-resilient-retry";
-
-function isRetryNotice(item: Record<string, unknown>): boolean {
-	if (typeof item.content === "string") return item.content.includes(RETRY_MARKER);
-	return JSON.stringify(item.content ?? "").includes(RETRY_MARKER);
-}
-
-/**
- * Remove this extension's own markers from the outgoing payload. The failed turn is not touched
- * here — `context_edit` already drops it — and the request is never left with an empty history:
- * an empty `input`/`messages` array makes the provider reject the call outright.
- */
-function stripRetryNoise(payload: unknown): { payload: unknown; removed: number } | undefined {
-	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
-	const body = payload as Record<string, unknown>;
-	let removed = 0;
-	const filter = (list: unknown): unknown[] | undefined => {
-		if (!Array.isArray(list)) return undefined;
-		const kept = list.filter(entry => {
-			if (!entry || typeof entry !== "object" || Array.isArray(entry)) return true;
-			if (!isRetryNotice(entry as Record<string, unknown>)) return true;
-			removed++;
-			return false;
-		});
-		// Never hand the provider an empty history.
-		return kept.length === 0 ? undefined : kept;
-	};
-	const messages = filter(body.messages);
-	const input = filter(body.input);
-	// Both undefined means stripping would empty the history, or there was nothing to strip.
-	if (!messages && !input) return undefined;
-	if (removed === 0) return undefined;
-	const next = { ...body };
-	if (messages) next.messages = messages;
-	if (input) next.input = input;
-	return { payload: next, removed };
-}
-
-function readConfig(settings: unknown): RetryConfig {
-	const raw = (settings as { resilientRetry?: Partial<RetryConfig> } | undefined)?.resilientRetry;
-	const num = (value: unknown, fallback: number) =>
-		typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
-	return {
-		maxRetries: num(raw?.maxRetries, DEFAULTS.maxRetries),
-		baseDelayMs: num(raw?.baseDelayMs, DEFAULTS.baseDelayMs),
-		maxDelayMs: num(raw?.maxDelayMs, DEFAULTS.maxDelayMs),
-		retryQuotaErrors: raw?.retryQuotaErrors === true,
-		repairHistory: raw?.repairHistory !== false,
-		repeatLimit: num(raw?.repeatLimit, DEFAULTS.repeatLimit),
-		// Accepts the legacy "first"/"always"/"never" strings too.
-		visibleRetry: raw?.visibleRetry === undefined
-			? DEFAULTS.visibleRetry
-			: !((raw.visibleRetry as unknown) === false || (raw.visibleRetry as unknown) === "never"),
-		noticeEvery: Math.max(1, Math.floor(num(raw?.noticeEvery, DEFAULTS.noticeEvery))),
-		debugLog: typeof raw?.debugLog === "string" && raw.debugLog ? raw.debugLog : undefined,
-	};
-}
-
-const REPLAYABLE_ROLES = new Set(["user", "assistant", "system", "developer"]);
-
-/** A history item whose payload alone carries its meaning, so its id can be dropped. */
-function isCompleteReplayable(item: Record<string, unknown>): boolean {
-	const kind = typeof item.type === "string" ? item.type : "message";
-	switch (kind) {
-		case "message":
-			return REPLAYABLE_ROLES.has(item.role as string) &&
-				(typeof item.content === "string" || Array.isArray(item.content));
-		case "function_call":
-			return typeof item.call_id === "string" && typeof item.name === "string" && typeof item.arguments === "string";
-		case "custom_tool_call":
-			return typeof item.call_id === "string" && typeof item.name === "string" && typeof item.input === "string";
-		case "function_call_output":
-		case "custom_tool_call_output":
-			return typeof item.call_id === "string" &&
-				(typeof item.output === "string" || Array.isArray(item.output));
-		default:
-			return false;
-	}
-}
-
-/**
- * Drop the optional `id` of complete history items so a different upstream node can accept
- * the replayed conversation. Message bodies, tool pairs, `call_id` and reasoning items all
- * survive, so the model keeps its cross-turn state.
- */
-function repairPayload(payload: unknown): { payload: unknown; removed: number } | undefined {
-	if (!payload || typeof payload !== "object" || Array.isArray(payload)) return undefined;
-	const body = payload as Record<string, unknown>;
-	if (!Array.isArray(body.input)) return undefined;
-	let removed = 0;
-	const kept = body.input.map(entry => {
-		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return entry;
-		const item = entry as Record<string, unknown>;
-		if (typeof item.id !== "string" || !item.id) return entry;
-		if (item.status !== undefined && item.status !== "completed") return entry;
-		if (!isCompleteReplayable(item)) return entry;
-		const { id: _dropped, ...rest } = item;
-		removed++;
-		return rest;
-	});
-	return removed > 0 ? { payload: { ...body, input: kept }, removed } : undefined;
-}
 
 export default function registerResilientRetry(pi: ExtensionAPI): void {
-	let consecutive = 0;
-	let lastFingerprint = "";
-	let sameErrorCount = 0;
-	let enabled = true;
-	let config = DEFAULTS;
+	let config = readConfig(undefined);
+	let policy = new RetryBudget(config);
+	let shutdown = new AbortController();
 	let cancelled = false;
-	let wake: (() => void) | undefined;
+	let retryDelay: number | undefined;
+	let showingRetry = false;
+	let runSignal: AbortSignal | undefined;
+	let runHasUI = false;
+	let abortUiListener: (() => void) | undefined;
 	// Armed only while a retry this extension started is in flight.
 	let repairArmed = false;
 	let repairedTotal = 0;
 
-	const STATUS_KEY = "resilient-retry";
-
-	/** Records why a decision was taken; silent non-retries are otherwise unexplainable. */
-	const debug = (entry: Record<string, unknown>) => {
-		if (!config.debugLog) return;
-		try {
-			appendFileSync(config.debugLog, `${JSON.stringify({ ts: new Date().toISOString(), pid: process.pid, ...entry })}\n`);
-		} catch {
-			// A debug sink must never break a run.
-		}
+	const debug = (entry: Record<string, unknown>) => writeRetryLog(config, entry);
+	const clearUi = (ctx: ExtensionContext) => {
+		if (showingRetry && ctx.hasUI) ctx.ui.setWorkingMessage();
+		showingRetry = false;
 	};
-
-	const clearUi = (ctx: { hasUI: boolean; ui: { setStatus: (key: string, text: string | undefined) => void } }) => {
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
+	const detachAbortUi = () => {
+		if (abortUiListener) runSignal?.removeEventListener("abort", abortUiListener);
+		abortUiListener = undefined;
 	};
+	pi.on("agent_start", (_event, ctx) => {
+		detachAbortUi();
+		runSignal = ctx.signal;
+		runHasUI = ctx.hasUI;
+		// Abort dispatch is synchronous, before SDK disposal invalidates this run's context.
+		abortUiListener = () => clearUi(ctx);
+		runSignal?.addEventListener("abort", abortUiListener, { once: true });
+	});
 
-	// Settings live on `pi`, not on the event context, and are ready before any run.
+	// The public settings getter is ready at session_start, not during factory loading.
 	pi.on("session_start", () => {
-		const settings = pi.getSettings() as { resilientRetry?: { enabled?: boolean } } & Parameters<typeof readConfig>[0];
-		enabled = settings.resilientRetry?.enabled !== false;
-		config = readConfig(settings);
-		consecutive = 0;
-		lastFingerprint = "";
-		sameErrorCount = 0;
+		detachAbortUi();
+		runSignal = undefined;
+		shutdown.abort();
+		shutdown = new AbortController();
+		config = readConfig(pi.getSettings());
+		policy = new RetryBudget(config);
 		cancelled = false;
-		debug({ event: "session_start", enabled, config: { ...config, debugLog: config.debugLog } });
+		retryDelay = undefined;
+		repairArmed = false;
+		repairedTotal = 0;
+		debug({ event: "session_start", enabled: config.enabled, config });
 	});
 
-	// A retry in flight must not swallow the user's Escape or /stop.
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		cancelled = true;
-		wake?.();
+		retryDelay = undefined;
+		repairArmed = false;
+		clearUi(ctx);
+		if (runSignal && !runSignal.aborted) ctx.abort();
+		shutdown.abort();
+		detachAbortUi();
 	});
 
-	// Repair only the request this extension retried, so ordinary requests keep their exact
-	// history and prompt-cache prefix. Disarmed as soon as one request has been repaired.
-	pi.on("before_provider_request", (event) => {
-		// Notices are printed for the user but never reach the model.
-		const stripped = stripRetryNoise(event.payload);
-		let payload = stripped ? stripped.payload : event.payload;
-		if (stripped) debug({ event: "retry_log_stripped", removed: stripped.removed });
-
-		if (repairArmed && config.repairHistory) {
-			repairArmed = false;
-			const repaired = repairPayload(payload);
-			if (repaired) {
-				repairedTotal += repaired.removed;
-				payload = repaired.payload;
-				debug({ event: "history_repaired", removed: repaired.removed });
+	pi.on("context", async (event, ctx) => {
+		const delay = retryDelay;
+		retryDelay = undefined;
+		if (delay !== undefined) {
+			// Public agent_start AND turn_start have fired before this wait: native UI is working.
+			const budget = config.maxRetries > 0 ? `/${config.maxRetries}` : "";
+			if (ctx.hasUI) {
+				ctx.ui.setWorkingMessage(`等待重试（第 ${policy.attempts}${budget} 次）· ${Math.round(delay / 1000)}s`);
+				showingRetry = true;
+			}
+			debug({ event: "retry_wait_start", attempt: policy.attempts, delayMs: delay });
+			const stopSignal = shutdown.signal;
+			const runSignal = ctx.signal;
+			const ready = await waitForRetry(delay, runSignal ? AbortSignal.any([stopSignal, runSignal]) : stopSignal);
+			// A replaced session owns new state/UI; do not use its predecessor's context.
+			if (stopSignal === shutdown.signal) {
+				if (!ready || cancelled || runSignal?.aborted) {
+					debug({ event: "retry_cancelled", attempt: policy.attempts, cancelled, aborted: runSignal?.aborted === true });
+					repairArmed = false;
+					// A directly disposed session has no live ctx after this await.
+					if (!runSignal?.aborted) {
+						if (cancelled) ctx.abort();
+						clearUi(ctx);
+					}
+				} else {
+					if (ctx.hasUI) ctx.ui.setWorkingMessage(`正在重试（第 ${policy.attempts}${budget} 次）`);
+					debug({ event: "retry_request", attempt: policy.attempts });
+				}
 			}
 		}
-		return stripped || payload !== event.payload ? payload : undefined;
+
+		// Old custom notices are identifiable before model conversion. Never filter ordinary
+		// user/assistant/tool text by a package-name substring: that can erase real memory.
+		const messages = event.messages.filter(message => message.role !== "custom" || message.customType !== "resilient-retry");
+		return messages.length === event.messages.length ? undefined : { messages };
 	});
 
-	pi.on("agent_before_settle", async (event, ctx) => {
-		const messages = event.context.contextMessages as { role: string; stopReason?: string; errorMessage?: string }[];
-		const last = [...messages].reverse().find(message => message.role === "assistant");
+	// Repair only the request this extension retried; normal requests retain their history.
+	pi.on("before_provider_request", (event) => {
+		if (!repairArmed || !config.repairHistory) return undefined;
+		repairArmed = false;
+		const repaired = repairPayload(event.payload);
+		if (repaired) {
+			repairedTotal += repaired.removed;
+			debug({ event: "history_repaired", removed: repaired.removed });
+			return repaired.payload;
+		}
+		return undefined;
+	});
+
+	pi.on("agent_before_settle", event => {
+		// Disposal may invalidate ctx but still finish dispatching terminal events.
+		if (runSignal?.aborted) {
+			debug({ event: "agent_before_settle", decision: "skip: run aborted", aborted: true });
+			return undefined;
+		}
+		const last = [...event.context.contextMessages].reverse().find(message => message.role === "assistant");
 		const seen = {
 			event: "agent_before_settle",
 			outcome: event.outcome,
 			stopReason: last?.stopReason,
-			error: (last?.errorMessage ?? "").slice(0, 160),
-			aborted: ctx.signal?.aborted === true,
-			hasUI: ctx.hasUI,
-			enabled,
+			aborted: runSignal?.aborted === true,
+			hasUI: runHasUI,
+			enabled: config.enabled,
 		};
 
-		if (!enabled || event.outcome !== "error") {
+		if (!config.enabled || event.outcome !== "error") {
 			debug({ ...seen, decision: "skip: not an error outcome" });
 			return undefined;
 		}
-		// An explicit abort (Escape, /stop) is a user decision, never a retry.
-		if (ctx.signal?.aborted) {
-			debug({ ...seen, decision: "skip: run aborted" });
-			return undefined;
-		}
-		if (last?.stopReason !== "error" || !shouldRetry(last.errorMessage, config)) {
+		// An explicit host Stop is a user decision, never a retry.
+		if (last?.stopReason !== "error") {
 			debug({ ...seen, decision: "skip: policy declined" });
-			clearUi(ctx);
-			return undefined;
-		}
-		const fingerprint = (last.errorMessage ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-		if (fingerprint === lastFingerprint) sameErrorCount++;
-		else {
-			lastFingerprint = fingerprint;
-			sameErrorCount = 1;
-		}
-		if (config.repeatLimit > 0 && sameErrorCount > config.repeatLimit) {
-			debug({ ...seen, decision: "skip: same error repeated", sameErrorCount });
-			clearUi(ctx);
-			if (ctx.hasUI) {
-				ctx.ui.notify(`同一错误已连续出现 ${sameErrorCount} 次，重试无法解决，已停止。${(last.errorMessage ?? "").slice(0, 200)}`, "error");
-			}
-			return undefined;
-		}
-		if (config.maxRetries > 0 && consecutive >= config.maxRetries) {
-			debug({ ...seen, decision: "skip: budget exhausted", consecutive });
-			clearUi(ctx);
-			if (ctx.hasUI) ctx.ui.notify(`上游连续失败 ${consecutive} 次，已停止重试。${last.errorMessage?.slice(0, 200) ?? ""}`, "error");
 			return undefined;
 		}
 
-		consecutive++;
-		const delay = backoff(config, consecutive);
-		const budget = config.maxRetries > 0 ? `/${config.maxRetries}` : "";
-		// Only a reported dead session justifies trading memory for a replayable history.
-		const deadSession = config.repairHistory && sessionIdsAreDead(last.errorMessage);
-		debug({ ...seen, decision: "retry", attempt: consecutive, delayMs: delay, repair: deadSession });
-
-		// A footer status is always visible and survives the wait, unlike a notification.
-		if (ctx.hasUI) {
-			const why = deadSession ? " · 会话 id 已失效，将剥离历史 id" : "";
-			ctx.ui.setStatus(STATUS_KEY, `⏳ 上游报错，重试第 ${consecutive}${budget} 次 · 等待 ${Math.round(delay / 1000)}s${why} · Esc 取消`);
-			ctx.ui.setWorkingMessage(`等待重试（第 ${consecutive}${budget} 次）· ${Math.round(delay / 1000)}s`);
-		}
-
-		// Sleep in slices so an abort during the wait is honoured within one slice.
-		cancelled = false;
-		const deadline = Date.now() + delay;
-		while (Date.now() < deadline && !cancelled && !ctx.signal?.aborted) {
-			const slice = Math.min(250, deadline - Date.now());
-			await new Promise<void>(resolve => {
-				const timer = setTimeout(resolve, slice);
-				wake = () => {
-					clearTimeout(timer);
-					resolve();
-				};
-			});
-		}
-		wake = undefined;
-		if (cancelled || ctx.signal?.aborted) {
-			debug({ event: "retry_cancelled", attempt: consecutive, cancelled, aborted: ctx.signal?.aborted === true });
-			clearUi(ctx);
-			return undefined;
-		}
-
-		// History stays byte-identical unless the upstream said the ids are unusable.
-		repairArmed = deadSession;
-
-		// Silent retry: drop the failed attempt from model context and continue the run. No message
-		// is sent, because a retry is the system re-invoking the model, not the user speaking.
+		// Only omit the failed request. Successful responses and tool results stay intact.
 		const failed = [...event.context.contextEntries]
 			.reverse()
-			.find(entry => entry.messages.includes(last as never));
+			.find(entry => entry.messages.includes(last));
 		if (!failed) {
-			debug({ event: "retry_no_target", attempt: consecutive });
-			clearUi(ctx);
+			debug({ event: "retry_no_target", attempt: policy.attempts });
 			return undefined;
 		}
 
-		const entries: Record<string, unknown>[] = [
-			{ type: "context_edit", targetId: failed.sourceEntry.id, replacement: null },
-		];
-		// Optional marker for clients that render custom entries. It never reaches the model:
-		// stripRetryNoise removes it from the payload.
-		if (config.visibleRetry && (consecutive === 1 || consecutive % config.noticeEvery === 0)) {
-			entries.push({
-				type: "custom_message",
-				customType: "resilient-retry",
-				content: `↻ pi-resilient-retry：上游请求失败，自动重试中（第 ${consecutive}${budget} 次）${deadSession ? "，已剥离失效的历史 id" : ""}`,
-				display: true,
-			});
+		const decision = policy.next(last.errorMessage);
+		if (!decision.retry) {
+			debug({ ...seen, ...decision, decision: `skip: ${decision.reason}` });
+			return undefined;
 		}
-		return { continue: true, entries: entries as never };
+		debug({ ...seen, ...decision, decision: "retry" });
+		retryDelay = decision.delayMs;
+		repairArmed = decision.repair;
+		return {
+			continue: true,
+			entries: [...event.entries, { type: "context_edit", targetId: failed.sourceEntry.id, replacement: null }],
+		};
 	});
 
-	// Any request that is not an error means the upstream recovered.
+	// Reset the consecutive-failure budget when the continued run succeeds or is aborted.
 	pi.on("agent_end", (event, ctx) => {
+		// Return UI ownership before SDK native backoff, whose controller is not this run signal.
+		detachAbortUi();
+		clearUi(ctx);
 		const last = event.messages.filter(message => message.role === "assistant").at(-1);
 		if (last?.role === "assistant" && last.stopReason !== "error") {
-			if (consecutive > 0 && ctx.hasUI) {
-				const repaired = repairedTotal > 0 ? `，并清理 ${repairedTotal} 个历史 id` : "";
-				ctx.ui.notify(`上游已恢复（重试 ${consecutive} 次后成功${repaired}）`, "info");
-				ctx.ui.setWorkingMessage();
+			if (policy.attempts > 0 && last.stopReason !== "aborted") {
+				debug({ event: "retry_recovered", attempts: policy.attempts, repairedTotal });
 			}
-			consecutive = 0;
+			policy.reset();
 			repairedTotal = 0;
-			lastFingerprint = "";
-			sameErrorCount = 0;
+			detachAbortUi();
 			clearUi(ctx);
 		}
+	});
+
+	pi.on("agent_settled", (event, ctx) => {
+		// Some adapters report an aborted request as error; the public run flag is authoritative.
+		const aborted = event.aborted || runSignal?.aborted;
+		if (aborted) {
+			policy.reset();
+			repairedTotal = 0;
+		}
+		retryDelay = undefined;
+		repairArmed = false;
+		detachAbortUi();
+		if (!aborted) clearUi(ctx);
 	});
 }

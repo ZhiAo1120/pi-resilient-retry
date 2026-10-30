@@ -1,6 +1,10 @@
 # pi-resilient-retry
 
-Keep retrying failed upstream API requests that Pi's built-in retry gives up on.
+Let Pi try its native recovery first, then continue the same task if the model request still fails.
+
+This is a protocol-independent **AgentSession fallback**, not a new model/provider entrance.
+Keep selecting your existing models in Pi or Percho; their protocol, auth and streaming remain
+owned by the SDK. Requires the public extension API in `@earendil-works/pi-coding-agent` 1.4.x.
 
 English | [中文](README.zh-CN.md)
 
@@ -13,11 +17,11 @@ install [pi-retry](https://github.com/ZhiAo1120/pi-retry) alongside it:
 |---|---|---|
 | Trigger | Automatic, retries on failure | You type `/retry` |
 | Job | Retry in the background so the task is not interrupted | Resume from the checkpoint without replaying finished work |
-| Budget | Unlimited, with a repeat guard | 3 failed requests, then it stops with a reason |
+| Budget | Plugin continuations; unlimited by default, with a repeat guard | See that package's manual retry policy |
 | History repair | Drops ids only when the upstream reports the ids are dead | `/retry` drops ids; `--deep` also drops reasoning |
 
-The lifecycle hooks do not conflict, so both can be installed. One keeps the task alive; the
-other makes your manual intervention precise.
+Their triggers differ. Stop automatic recovery before invoking manual `/retry`.
+The companion's behavior and combined-package integration have not been re-verified here.
 
 ## The problem
 
@@ -27,8 +31,8 @@ usual reason a flaky routing proxy kills a long task: a `400` from the upstream,
 message like `upstream sent an error event`, or a relay-specific rejection.
 
 This extension hooks `agent_before_settle`, the last boundary in Pi that can force one more
-model request. When a run ends on a retryable error and the user did not abort, it waits out a
-backoff delay and continues the run.
+model request. When a run ends on a retryable error and the user did not abort, it starts a
+native continuation, then waits out the backoff before sending the request.
 
 ## Install
 
@@ -38,7 +42,9 @@ pi install git:github.com/ZhiAo1120/pi-resilient-retry
 pi install /path/to/pi-resilient-retry
 ```
 
-Restart Pi or run `/reload`. The extension loads on its own; no per-session setup.
+Restart Pi or run `/reload` once idle. No per-model setup or new provider/auth configuration
+is needed, **provided the host loads this extension into that session**. See the Percho child-session
+limitation below.
 
 ## Settings
 
@@ -52,7 +58,6 @@ All optional.
     "baseDelayMs": 2000,
     "maxDelayMs": 60000,
     "repeatLimit": 30,
-    "visibleRetry": false,
     "retryQuotaErrors": false,
     "repairHistory": true
   }
@@ -62,17 +67,18 @@ All optional.
 | Setting | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Turn the extension off without uninstalling it. |
-| `maxRetries` | `0` | Consecutive retries allowed without a successful request. `0` = unlimited. |
+| `maxRetries` | `0` | Consecutive **plugin continuations** without success. `0` = unlimited, not a total HTTP request cap. |
 | `baseDelayMs` | `2000` | First backoff delay; doubles per attempt. |
 | `maxDelayMs` | `60000` | Delay ceiling. Every delay is clamped to it. |
-| `repeatLimit` | `30` | Attempts allowed for one **unchanged** error. `0` disables the guard. |
-| `visibleRetry` | `false` | Add a `custom_message` marker per retry. Stripped from the payload. |
-| `noticeEvery` | `1` | Print every Nth attempt; the first of a burst is always printed. |
+| `repeatLimit` | `30` | Consecutive identical terminal errors, compared using the full whitespace-normalized error. `0` disables the guard. |
 | `retryQuotaErrors` | `false` | Also retry quota/billing errors. |
 | `repairHistory` | `true` | Allow dropping replay-only history ids, only when the upstream says the ids are dead. |
+| `debugLog` | unset | Optional JSONL decision-metadata file. No raw errors, prompts, payloads, auth or headers. |
 
-`maxRetries` and `repeatLimit` reset after any successful request, so they bound one outage,
-not the whole session.
+`maxRetries` and `repeatLimit` reset after success, an aborted settlement, or session initialization.
+They bound consecutive terminal failures, not the whole session. Nonnegative finite numbers are
+accepted; invalid numeric values use defaults. Fractional delays are retained (subject to timer resolution). Legacy `visibleRetry` and `noticeEvery` settings are ignored
+and can be removed; leaving `visibleRetry: true` no longer adds conversation markers.
 
 ## How a retry works
 
@@ -82,18 +88,21 @@ request. No message is ever sent on your behalf:
 
 ```
 session:  user "hi" → assistant (error) → [context omit] → assistant (error) → [context omit] → assistant "answer"
-requests: payload 5787B, one user message, identical every attempt
+requests: original messages and history; ordinary retry payloads stay identical
 ```
 
-The failed attempt is removed with `context_edit`, so the model receives the original request
-unchanged: no growth, no lost memory, stable prompt-cache prefix.
+`context_edit` omits the failed attempt from **future model context** without adding a prompt
+or losing earlier memory. The original error and the edit remain in the append-only session
+file: this does not delete raw history or make the file stop growing. Pending boundary edits
+from earlier extensions are preserved; the plugin appends its own failed-attempt edit.
 
-### Optional marker
+### No retry messages
 
-`visibleRetry: true` adds a `custom_message` marker per retry (thinned by `noticeEvery`). The
-marker is stripped from the outgoing payload, so the model never sees it. It is off by default
-because Pi sessions are append-only — every marker stays in the session file forever — and
-Percho does not render custom messages anyway.
+No user, assistant, or `custom_message` is injected, and the model is not asked to announce
+retries. Old custom messages with `customType: "resilient-retry"` are excluded by identity when
+building model input, without rewriting the session file. Real user messages, assistant
+responses, and tool results are preserved even when they mention `pi-resilient-retry`.
+Notices that very old versions wrote as real user messages are not guessed at and deleted by text.
 
 ## Why a retry is not just the same request again
 
@@ -109,31 +118,57 @@ Repair runs only when the upstream explicitly reports that the session ids are u
 | `belongs to a different upstream account` | Same class of replay rejection. |
 | `previous_response_id` / `item` / `session` … `not found` \| `expired` \| `invalid` | The id no longer resolves. |
 
-Every other failure retries with the history **byte-identical**, so the model keeps its memory
-and the prompt-cache prefix stays intact. When repair does run, only the optional `id` of
+For other failures the plugin makes **no payload/history repair edits**. The loopback fixtures
+verify byte-identical ordinary requests; SDK routing and other extensions still own their own transformations. When repair does run, only the optional `id` of
 complete items is dropped; message bodies, tool call pairs, `call_id`, `encrypted_content` and
 every reasoning item survive. Repair is armed for one request only.
 
-Set `repairHistory: false` to send retries byte-identical instead.
+Set `repairHistory: false` to disable these edits. Repair never rewrites wire model IDs,
+`messages.provider`/`api`, call IDs, thinking signatures, or stored history. It does not clear
+transport `previous_response_id`, reference-only items or encrypted reasoning: there is not enough
+information to reconstruct them safely. Seeing their IDs in an error does not guarantee repair.
+A loopback accepting omitted IDs does **not** prove every real service accepts that schema.
 
-## Seeing that a retry happened
+## Seeing a retry in progress
 
-Percho renders none of Pi's extension UI channels (`notify`, `setStatus`, `custom_message`),
-so the conversation is the only place a retry can be attributed. Every retry appears as:
+Retries use Pi / Percho's **native agent-working indicator**, not extension UI channels that
+Percho does not consume:
 
 ```
-↻ pi-resilient-retry：上游请求失败，自动重试中（第 1 次）。
+failure → agent_end → agent_before_settle (request continuation immediately)
+        → agent_start → turn_start → context (backoff wait) → provider request
 ```
 
-In a terminal Pi session the footer also shows live progress
-(`⏳ 上游报错，重试第 3/30 次 · 等待 12s · Esc 取消`). Escape, `/stop`, or closing the session
-cancels the wait within a quarter second.
+- **Native activity:** real `agent_start` and `turn_start` events precede backoff. The host can
+  use its usual working state; the plugin does not fake events, error cards or a result pane.
+- **Terminal Pi:** where the host implements `setWorkingMessage`, text changes from
+  “等待重试（第 N 次）” (waiting) to “正在重试（第 N 次）” (requesting).
+- **Cancel / finish:** use the host's Stop action or close the session. An AbortSignal listener
+  wakes backoff immediately; timers/listeners are cleaned up, including very large delays.
+  Success, cancellation and retry limits clear the plugin's working text. Direct disposal
+  clears it on the genuine abort signal before the SDK invalidates the context; terminal
+  callbacks do not access that disposed context. On every low-level `agent_end`, plugin
+  text is returned to the host before any SDK-native backoff (which uses a separate controller).
+  The late settlement callback uses event data and cached run metadata, not live context getters.
+- **Verification limit:** SDK/RPC activity and cancellation are exercised; interactive TUI,
+  full Percho desktop animation and result-pane visuals have not been observed.
+
+Waiting inside `agent_before_settle` is too late: the preceding low-level `agent_end` already
+turned off the native indicator. Blocking a start-event handler is also too early: Pi waits
+for extension handlers before notifying UI subscribers. Backoff therefore runs in `context`,
+**after both start events**; the wait itself does not modify any messages.
+
+There is still a normal lifecycle transition between each low-level run and its continuation.
+The host can briefly reset or retain its native error cards. This extension neither fabricates
+lifecycle events nor patches Percho to hide those records. Use the debug log below for exact
+attempt counts and decision reasons.
 
 ## Stopping an impossible loop
 
-Unlimited retries are only safe while the failure keeps changing. When the **same** error
-repeats with no successful request in between, repeating it cannot help, so the extension
-stops and reports it.
+The repeat guard stops an unproductive loop of identical errors; it does not prove that
+changing errors are safe or cheap to retry. Use a finite `maxRetries` if you need a bounded
+plugin budget. Error comparison hashes the full whitespace-normalized string, so distinct
+long errors sharing a prefix no longer incorrectly trip the guard.
 
 A different error each attempt (a relay rotating nodes) keeps retrying without limit; an
 identical error thirty-one times in a row does not.
@@ -146,46 +181,103 @@ Set a debug log to record every decision:
 { "resilientRetry": { "debugLog": "/tmp/resilient-retry.log" } }
 ```
 
-Each settle boundary appends one JSON line with the outcome, the assistant `stopReason`, the
-error head, whether the run was aborted, and the decision taken:
+Records contain only allowlisted event/decision labels, counters, flags and a SHA-256
+`errorFingerprint`. Raw upstream error text, request/response bodies, credentials, headers
+and the configured log path are never written. Newly created files use mode `0600`;
+existing-file permissions are not changed. SDK/host logs and raw session records are separate.
 
 ```json
-{"event":"session_start","enabled":true,"config":{...}}
-{"event":"agent_before_settle","outcome":"error","stopReason":"error",
- "error":"503: {\"message\":\"Upstream service unavailable\"}","aborted":false,
- "hasUI":false,"decision":"retry","attempt":1,"delayMs":2000,"repair":false}
-{"event":"agent_before_settle","outcome":"error","stopReason":"error",...,
- "decision":"skip: run aborted"}
+{"event":"agent_before_settle","outcome":"error","stopReason":"error","aborted":false,"decision":"retry","attempt":1,"delayMs":2000,"repair":false}
+{"event":"agent_before_settle","outcome":"error","stopReason":"error","decision":"skip: policy declined"}
 ```
 
-No `session_start` line at all means the extension never loaded. Remove `debugLog` when done.
+Normally startup records `session_start`. If it is missing, check both loading **and a writable
+sink in the correct settings scope**: sink failures are deliberately ignored and never break a run.
+Remove `debugLog` when done.
 
 ## What it does not do
 
-- **No tool replay.** A retry repeats the failed model request only; it never re-runs a tool.
-- **No abort override.** Escape, `/stop`, and a cancelled run are never retried.
-- **No error-text filtering for retries.** A relay fronts many upstreams, so a rejection from
-  one node says nothing about the next. Every failure gets another attempt; the text is read
-  only to decide whether the session ids are dead.
+- **No task/tool replay by the plugin.** Completed tools/results remain in context; new tool
+  calls chosen by the model still belong to Pi. Failed partial text can be regenerated, while
+  the real failed response remains in raw history.
+- **No abort override.** A cancelled run is never retried. The public aborted settlement flag
+  also resets the budget when an adapter reports its last message as `error` rather than `aborted`.
+- **Explicit policy only.** Quota/billing errors are excluded by default. Other terminal errors
+  are eligible subject to the repeat/finite budget guards; error text also gates ID repair.
+- **No global interceptor.** Direct provider calls outside a loaded AgentSession, tool HTTP
+  calls and image-generation APIs are not automatically covered.
 
 ## Relationship to Pi's built-in retry
 
-Both layers run. Pi's retry handles the transient errors it recognises first; this extension
-catches whatever Pi refuses. Keeping Pi's own settings intact preserves its quota detection,
-which this extension relies on for its default policy.
+The order is **request → Pi native recovery → exhausted/not applicable → plugin continuation**.
+The plugin never edits `retry` or `retry.provider`, overrides providers, or adds an inner stream/client
+retry layer. Each continuation still goes through Pi's existing native policy.
+
+Consequently `resilientRetry.maxRetries` is not a total wire-attempt cap: with one native retry
+and one plugin continuation, repeated failures can produce four HTTP attempts. In contrast,
+`retry.maxRetries: 0` disables Pi's native retry, while `resilientRetry.maxRetries: 0` means unlimited
+plugin continuations. Keep those budgets distinct.
+
+## Percho and SDK limits
+
+Current verification uses Pi CLI/SDK **1.4.0** and Percho **0.6.6**, whose SDK actually exports
+`VERSION 1.4.0`. A `PI_PACKAGE_DIR` environment override can change reported package/assets
+versions; package names or old research notes alone are not runtime proof.
+
+Percho's built-in subagent loader uses `noExtensions: true`, injects its permission factory only,
+and shares the ModelRuntime, **not extension lifecycle handlers**. A provider callback runs before
+native retry decisions; its public options do not reveal child-native exhaustion or a stable logical
+request ID. Thus a transparent native-first child wrapper is **not shipped**: it would either guess,
+retry too early, or need prohibited private host changes.
+
+The current SDK already supports native-first recovery when the child explicitly loads this
+factory: its public `agent_before_settle` hook is sufficient. What is missing is Percho's child
+loader wiring, not a new SDK retry algorithm. Keep `noExtensions: true` and the permission gate,
+then allowlist this factory for each child. Pi CLI-based subagents can also work if their child
+process loads the extension; parent loading alone does not establish that. No `subagent_extension:result`
+bridge, `taskId` fabrication, UI plugin or installation patch is used.
 
 ## Development
 
 ```bash
 npm install
-npm test     # policy unit tests, no network
+npm test     # policy checks + real SDK / loopback HTTP lifecycle tests, no external network
 npm run check
 ```
 
-Verified end to end against fake upstreams: consecutive `400`s recover after retry; a quota
-error with `retryQuotaErrors: false` stops after one request; a transient 503 keeps history ids
-intact; a cross-resource rejection recovers after ids are stripped; an unchanged error stops at
-`repeatLimit`; silent retries keep the request payload constant.
+`index.ts` is the lifecycle adapter; `retry-core.ts` owns the policy, budget, waits, repair and
+metadata logger. No new runtime SDK/client dependency was added. The package has one explicit
+extension entry and includes the core file.
+
+Tests exercise SDK/client and native exhaustion **before** plugin recovery, native success/Stop bypass,
+quota opt-in, finite/unlimited budgets, no completed-tool replay, legacy-marker identity,
+full-error fingerprints, timer overflow/listener cleanup and private logging. Real Responses
+and Anthropic HTTP fixtures cover images, thinking/text signatures, tool pairing, hook-returned
+payloads, headers, usage, immutable ID repair and a genuinely truncated stream. These are
+SDK/loopback observations, **not real-vendor/OAuth acceptance tests**.
+
+To run the same lifecycle tests directly against Percho's bundled SDK on macOS (without
+opening a desktop window or modifying the installation):
+
+```bash
+(
+  ROOT=$(mktemp -d)
+  trap 'rm -rf "$ROOT"' EXIT
+  mkdir -p "$ROOT/agent"
+  env -i PATH="$PATH" HOME="$ROOT" PI_CODING_AGENT_DIR="$ROOT/agent" PI_OFFLINE=1 \
+    ELECTRON_RUN_AS_NODE=1 \
+    PI_RETRY_TEST_SDK=/Applications/Percho.app/Contents/Resources/app.asar/node_modules/@earendil-works/pi-coding-agent/dist/index.js \
+    /Applications/Percho.app/Contents/MacOS/Percho --experimental-strip-types --test test/*.test.mjs
+)
+```
+
+Workspace-only packaging proofs/reports live in
+`.local/agent-work/pi-resilient-retry-optimization/package-proof/` (not in the npm archive).
+They use the real CLI RPC entrance and both SDKs' normal package/JITI loader, with temporary
+HOME/config/session, fake keys and loopback only. Cold load, idle reload, disable/re-enable,
+parallel-session isolation, parent disposal, missing-factory controls and Stop are distinguished
+from complete host/desktop verification. No real credentials/configuration were changed;
+no upstream OAuth, WebSocket or native Percho child UI has been verified.
 
 ## License
 
