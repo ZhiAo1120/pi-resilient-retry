@@ -1,5 +1,7 @@
 # pi-resilient-retry
 
+[![npm version](https://img.shields.io/npm/v/pi-resilient-retry)](https://www.npmjs.com/package/pi-resilient-retry)
+
 Let Pi try its native recovery first, then continue the same task if the model request still fails.
 
 This is a protocol-independent **AgentSession fallback**, not a new model/provider entrance.
@@ -34,17 +36,54 @@ This extension hooks `agent_before_settle`, the last boundary in Pi that can for
 model request. When a run ends on a retryable error and the user did not abort, it starts a
 native continuation, then waits out the backoff before sending the request.
 
-## Install
+## Install from npm
+
+Package: [`pi-resilient-retry`](https://www.npmjs.com/package/pi-resilient-retry).
+Use Pi's package manager so it loads the declared extension entry:
+
+```bash
+# Latest published npm version
+pi install npm:pi-resilient-retry
+
+# Pin a particular release
+pi install npm:pi-resilient-retry@0.1.0
+```
+
+Requires Node.js 22.19+ and the compatible Pi extension API described above. Restart Pi or
+run `/reload` once idle. No new model/provider/auth configuration is needed, **provided the
+host loads this extension into that session**. Npm installation does not remove the Percho
+child-session limitation below.
+
+### Update an npm installation
+
+```bash
+# Update this installed package (when its npm source is not pinned)
+pi update npm:pi-resilient-retry
+
+# Or update all installed packages
+pi update --extensions
+```
+
+Then restart or `/reload` once idle. A source pinned to `@0.1.0` stays on that version;
+install a newer explicit version to change the pin. A Git commit/push is not an npm release,
+and a Pi CLI upgrade does not automatically update this package.
+
+### Git, local development and migration
 
 ```bash
 pi install git:github.com/ZhiAo1120/pi-resilient-retry
-# or, during development, load a checkout directly
 pi install /path/to/pi-resilient-retry
 ```
 
-Restart Pi or run `/reload` once idle. No per-model setup or new provider/auth configuration
-is needed, **provided the host loads this extension into that session**. See the Percho child-session
-limitation below.
+Keep **one** installation source for this extension. If switching from Git/local to npm,
+inspect `pi list`, remove the old source, then install npm; do not load both copies:
+
+```bash
+pi remove git:github.com/ZhiAo1120/pi-resilient-retry
+pi install npm:pi-resilient-retry
+```
+
+For a local installation, remove the actual path shown by `pi list` instead of the Git source.
 
 ## Settings
 

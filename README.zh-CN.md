@@ -1,5 +1,7 @@
 # pi-resilient-retry
 
+[![npm 版本](https://img.shields.io/npm/v/pi-resilient-retry)](https://www.npmjs.com/package/pi-resilient-retry)
+
 **先让 Pi 执行原生恢复；仍失败时，插件才继续同一任务。**
 
 这是与模型协议无关的 **AgentSession 兜底流程**，不是新增「带重试的模型入口」。
@@ -31,16 +33,53 @@ Pi 本身**有**自动重试：过载、429、5xx、超时、流中断，最多�
 本扩展在 `agent_before_settle`（Pi 中最后一个能强制再发一次模型请求的边界）加了一层兜底。
 当运行因可重试错误结束、且用户没有中止时，先启动原生续跑，再在请求发出前等待退避。
 
-## 安装
+## 从 npm 安装
+
+npm 包：[`pi-resilient-retry`](https://www.npmjs.com/package/pi-resilient-retry)。
+请用 Pi 的包管理器安装，才能按包内声明加载扩展入口：
+
+```bash
+# 安装 npm 最新已发布版本
+pi install npm:pi-resilient-retry
+
+# 固定到指定版本
+pi install npm:pi-resilient-retry@0.1.0
+```
+
+需要 Node.js 22.19+ 及上文兼容的 Pi 扩展 API。重启 Pi，或在空闲时 `/reload`。
+无需新模型 / provider / 鉴权配置，**前提是宿主向该会话加载本扩展**。
+npm 安装不会消除下文的 Percho 内置子会话限制。
+
+### 更新 npm 安装
+
+```bash
+# 更新这个已安装包（npm 来源没有固定版本时）
+pi update npm:pi-resilient-retry
+
+# 或更新全部已安装包
+pi update --extensions
+```
+
+之后重启或在空闲时 `/reload`。固定到 `@0.1.0` 的来源仍停留在该版本，
+要升级固定版本请显式安装新版本号。Git commit / push 不等于 npm 发布，
+升级 Pi CLI 也不等于自动升级这个包。
+
+### Git、本地开发与迁移
 
 ```bash
 pi install git:github.com/ZhiAo1120/pi-resilient-retry
-# 开发时直接加载检出目录
 pi install /path/to/pi-resilient-retry
 ```
 
-重启 Pi，或在空闲时执行 `/reload`。无需逐模型配置，也不需要新 provider / 鉴权入口，
-**前提是宿主会向这个会话加载本扩展**。Percho 内置子会话的限制见下文。
+本扩展请只保留**一个安装来源**。从 Git / 本地迁移到 npm 时，先 `pi list`
+确认旧来源，移除后再装 npm；不要同时加载两份：
+
+```bash
+pi remove git:github.com/ZhiAo1120/pi-resilient-retry
+pi install npm:pi-resilient-retry
+```
+
+原来从本地安装的，请移除 `pi list` 显示的真实路径，而不是上面的 Git 来源。
 
 ## 配置
 
