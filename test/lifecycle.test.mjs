@@ -17,7 +17,8 @@ const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2
 /** Real Pi lifecycle and HTTP payloads, with no user config, credentials, or external API. */
 async function fixture(t, { failures = 2, status = 400, errorMessage = "relay rejected this node",
 	delayMs = 120, retry = {}, nativeRetry = {}, providerRetry = {}, onEvent,
-	toolFirst = false, legacyNotices = false, loadPlugin = true, observeProvider = false, boundaryEdit = false, ui = false } = {}) {
+	toolFirst = false, legacyNotices = false, loadPlugin = true, observeProvider = false, boundaryEdit = false, ui = false,
+	turnLimit = false, repeatTurnLimit = false, failTurnLimitSummary = false } = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "pi-retry-test-"));
 	t.after(() => rmSync(dir, { recursive: true, force: true }));
 	const requests = [];
@@ -33,14 +34,23 @@ async function fixture(t, { failures = 2, status = 400, errorMessage = "relay re
 		for await (const chunk of req) raw += chunk;
 		requests.push({ raw, payload: JSON.parse(raw), time: performance.now() });
 		const toolResponse = toolFirst && requests.length === 1;
-		if (!toolResponse && requests.length <= failures + (toolFirst ? 1 : 0)) {
-			res.writeHead(status, { "Content-Type": "application/json" });
-			res.end(JSON.stringify({ error: { message: errorMessage } }));
+		const turnLimitFailure = turnLimit && (requests.length === 1 || (repeatTurnLimit && requests.length === 4));
+		if (turnLimitFailure || (!turnLimit && !toolResponse && requests.length <= failures + (toolFirst ? 1 : 0))) {
+			res.writeHead(turnLimitFailure ? 400 : status, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: { message: turnLimitFailure
+				? 'magpie API error (400): {"code":"session_turn_limit_exceeded","message":"This conversation has reached 100 model turns."}'
+				: errorMessage } }));
 			return;
 		}
+		if (turnLimit && requests.length === 2 && failTurnLimitSummary) {
+			res.writeHead(400, { "Content-Type": "application/json" });
+			res.end(JSON.stringify({ error: { message: "summary provider unavailable" } }));
+			return;
+		}
+		const turnLimitSummary = turnLimit && requests.length === 2;
 		const delta = toolResponse
 			? { role: "assistant", tool_calls: [{ index: 0, id: "call_once", type: "function", function: { name: "once", arguments: "{}" } }] }
-			: { role: "assistant", content: "Recovered" };
+			: { role: "assistant", content: turnLimitSummary ? "## Goal\\nContinue the current task.\\n## Progress\\nThe context was compacted." : "Recovered" };
 		res.writeHead(200, { "Content-Type": "text/event-stream" });
 		res.end(`data: ${JSON.stringify({
 			id: "local-response", object: "chat.completion.chunk", model: "fixture",
@@ -55,7 +65,7 @@ async function fixture(t, { failures = 2, status = 400, errorMessage = "relay re
 	t.after(() => { server.closeAllConnections(); server.close(); });
 
 	const settingsManager = SettingsManager.inMemory({
-		compaction: { enabled: false },
+		compaction: { enabled: false, keepRecentTokens: turnLimit ? 0 : 20000 },
 		// Count agent-level native retries independently of SDK/client retries in this fixture.
 		retry: { enabled: true, maxRetries: 1, baseDelayMs: 1, ...nativeRetry,
 			provider: { maxRetries: 0, ...providerRetry } },
@@ -134,8 +144,59 @@ async function fixture(t, { failures = 2, status = 400, errorMessage = "relay re
 	});
 	return { session, manager, requests, events, extensionErrors, signals, boundaries, providerCalls,
 		settingsManager, originalRetrySettings, originalProviderRetrySettings, workingMessages, delayMs,
+		waitForEvent(type, occurrence = 1) {
+			let seen = events.filter(event => event.type === type).length;
+			if (seen >= occurrence) return Promise.resolve();
+			return new Promise(resolve => {
+				const unsubscribe = session.subscribe(event => {
+					if (event.type === type && ++seen >= occurrence) {
+						unsubscribe();
+						resolve(event);
+					}
+				});
+			});
+		},
 		get toolExecutions() { return toolExecutions; } };
 }
+
+test("Magpie's session turn limit compacts once and resumes the task", { timeout: 10000 }, async t => {
+	const h = await fixture(t, { turnLimit: true, delayMs: 1 });
+	const compaction = h.waitForEvent("compaction_end");
+	const resumed = h.waitForEvent("agent_settled", 2);
+	await h.session.prompt("Continue the existing task after a provider turn-limit error.");
+	await compaction;
+	await resumed;
+	assert.equal(h.requests.length, 4, "failed request, two summary requests, and resumed task");
+	assert.equal(h.manager.getBranch().filter(entry => entry.type === "compaction").length, 1);
+	assert.equal(h.manager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "resilient-retry-turn-limit").length, 1);
+	assert.equal(h.session.messages.at(-1).stopReason, "stop");
+	assert.deepEqual(h.extensionErrors, []);
+});
+
+	test("a repeated turn-limit error after compaction is not compacted or retried again", { timeout: 10000 }, async t => {
+	const h = await fixture(t, { turnLimit: true, repeatTurnLimit: true, delayMs: 1 });
+	const compaction = h.waitForEvent("compaction_end");
+	const resumed = h.waitForEvent("agent_settled", 2);
+	await h.session.prompt("Continue the existing task after a provider turn-limit error.");
+	await compaction;
+	await resumed;
+	assert.equal(h.requests.length, 4);
+	assert.equal(h.manager.getBranch().filter(entry => entry.type === "compaction").length, 1);
+	assert.equal(h.session.messages.at(-1).stopReason, "error");
+	assert.deepEqual(h.extensionErrors, []);
+});
+
+test("a failed turn-limit compaction does not automatically retry", { timeout: 10000 }, async t => {
+	const h = await fixture(t, { turnLimit: true, failTurnLimitSummary: true, delayMs: 1 });
+	const compaction = h.waitForEvent("compaction_end");
+	await h.session.prompt("Continue the existing task after a provider turn-limit error.");
+	await compaction;
+	assert.equal(h.requests.length, 2, "one failed request and one failed summary request");
+	assert.equal(h.manager.getBranch().filter(entry => entry.type === "compaction").length, 0);
+	assert.equal(h.manager.getBranch().filter(entry => entry.type === "custom_message" && entry.customType === "resilient-retry-turn-limit").length, 0);
+	assert.equal(h.session.isIdle, true);
+	assert.deepEqual(h.extensionErrors, []);
+});
 
 test("retry backoff runs after native agent_start AND turn_start, with identical real payloads", { timeout: 10000 }, async t => {
 	const h = await fixture(t, { retry: { visibleRetry: true } });

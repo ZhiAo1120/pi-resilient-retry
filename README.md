@@ -135,10 +135,21 @@ or losing earlier memory. The original error and the edit remain in the append-o
 file: this does not delete raw history or make the file stop growing. Pending boundary edits
 from earlier extensions are preserved; the plugin appends its own failed-attempt edit.
 
-### No retry messages
+### Magpie conversation turn limit
 
-No user, assistant, or `custom_message` is injected, and the model is not asked to announce
-retries. Old custom messages with `customType: "resilient-retry"` are excluded by identity when
+When an error contains `session_turn_limit_exceeded`, the extension does not treat it as an ordinary
+400 retry. After the run settles, it uses Pi's public compaction API and queues a hidden continuation
+only after compaction succeeds. It attempts this at most once per user request. If compaction fails,
+or the same error returns after compaction, it stops to avoid a loop; run `/compact` manually if needed.
+Other 400 errors do not use this path and remain subject to the ordinary retry policy.
+
+### No visible messages for ordinary retries
+
+Ordinary retries do not inject user, assistant or `custom_message` entries, and do not ask the model
+to announce a retry. The turn-limit recovery above adds one hidden internal continuation only after
+compaction succeeds; it is not displayed as a user message.
+
+Old custom messages with `customType: "resilient-retry"` are excluded by identity when
 building model input, without rewriting the session file. Real user messages, assistant
 responses, and tool results are preserved even when they mention `pi-resilient-retry`.
 Notices that very old versions wrote as real user messages are not guessed at and deleted by text.

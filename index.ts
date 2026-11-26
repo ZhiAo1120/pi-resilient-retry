@@ -1,6 +1,12 @@
 import { readConfig, RetryBudget, waitForRetry, repairPayload, writeRetryLog } from "./retry-core.ts";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+const SESSION_TURN_LIMIT_ERROR = /session_turn_limit_exceeded/i;
+
+function isSessionTurnLimitError(error: string | undefined): boolean {
+	return typeof error === "string" && SESSION_TURN_LIMIT_ERROR.test(error);
+}
+
 /**
  * Keeps retrying provider failures that Pi's built-in retry gives up on.
  * `agent_before_settle` requests a context-only continuation; backoff runs after
@@ -20,6 +26,9 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	// Armed only while a retry this extension started is in flight.
 	let repairArmed = false;
 	let repairedTotal = 0;
+	let turnLimitCompactionAttempted = false;
+	let pendingTurnLimitCompaction: number | undefined;
+	let sessionGeneration = 0;
 
 	const debug = (entry: Record<string, unknown>) => writeRetryLog(config, entry);
 	const clearUi = (ctx: ExtensionContext) => {
@@ -51,6 +60,9 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		retryDelay = undefined;
 		repairArmed = false;
 		repairedTotal = 0;
+		turnLimitCompactionAttempted = false;
+		pendingTurnLimitCompaction = undefined;
+		sessionGeneration++;
 		debug({ event: "session_start", enabled: config.enabled, config });
 	});
 
@@ -58,6 +70,8 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		cancelled = true;
 		retryDelay = undefined;
 		repairArmed = false;
+		pendingTurnLimitCompaction = undefined;
+		sessionGeneration++;
 		clearUi(ctx);
 		if (runSignal && !runSignal.aborted) ctx.abort();
 		shutdown.abort();
@@ -114,7 +128,11 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	pi.on("agent_before_settle", event => {
+	pi.on("before_agent_start", event => {
+		if (event.messageType === "user") turnLimitCompactionAttempted = false;
+	});
+
+	pi.on("agent_before_settle", (event, ctx) => {
 		// Disposal may invalidate ctx but still finish dispatching terminal events.
 		if (runSignal?.aborted) {
 			debug({ event: "agent_before_settle", decision: "skip: run aborted", aborted: true });
@@ -149,6 +167,20 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 			return undefined;
 		}
 
+		if (isSessionTurnLimitError(last.errorMessage)) {
+			if (turnLimitCompactionAttempted) {
+				debug({ ...seen, decision: "skip: turn-limit compaction already attempted" });
+				if (ctx.hasUI) ctx.ui.notify("The provider turn limit was reached again after automatic compaction. Stopping to avoid a retry loop; run /compact manually or start a new session.", "warning");
+				return undefined;
+			}
+			turnLimitCompactionAttempted = true;
+			pendingTurnLimitCompaction = sessionGeneration;
+			debug({ ...seen, decision: "compact: provider turn limit" });
+			return {
+				entries: [...event.entries, { type: "context_edit", targetId: failed.sourceEntry.id, replacement: null }],
+			};
+		}
+
 		const decision = policy.next(last.errorMessage);
 		if (!decision.retry) {
 			debug({ ...seen, ...decision, decision: `skip: ${decision.reason}` });
@@ -181,6 +213,38 @@ export default function registerResilientRetry(pi: ExtensionAPI): void {
 	});
 
 	pi.on("agent_settled", (event, ctx) => {
+		const compactionGeneration = pendingTurnLimitCompaction;
+		pendingTurnLimitCompaction = undefined;
+		if (compactionGeneration !== undefined && compactionGeneration === sessionGeneration && !event.aborted && !runSignal?.aborted) {
+			debug({ event: "turn_limit_compaction", decision: "started", attempt: 1 });
+			const reportCompactionFailure = () => {
+				if (compactionGeneration !== sessionGeneration || cancelled) return;
+				debug({ event: "turn_limit_compaction", decision: "failed", attempt: 1 });
+				if (ctx.hasUI) ctx.ui.notify("Automatic compaction for the provider turn limit failed. Run /compact manually before continuing.", "warning");
+			};
+			try {
+				ctx.compact({
+					customInstructions: "The latest provider request was rejected only because its conversation turn limit was reached. Preserve the user's current goal, requirements, completed work, and next steps. Do not treat the provider error as task output.",
+					onComplete: () => {
+						if (compactionGeneration !== sessionGeneration || cancelled) return;
+						debug({ event: "turn_limit_compaction", decision: "succeeded", attempt: 1 });
+						try {
+							pi.sendMessage({
+								customType: "resilient-retry-turn-limit",
+								content: "The previous model request was rejected because the provider reached its per-conversation turn limit. The session has now been compacted. Continue the current task from the compacted checkpoint. Do not repeat successful tool calls or side effects. If the provider returns the same turn-limit error again, stop instead of retrying.",
+								display: false,
+							}, { triggerTurn: true });
+						} catch {
+							reportCompactionFailure();
+						}
+					},
+					onError: reportCompactionFailure,
+				});
+			} catch {
+				reportCompactionFailure();
+			}
+		}
+
 		// Some adapters report an aborted request as error; the public run flag is authoritative.
 		const aborted = event.aborted || runSignal?.aborted;
 		if (aborted) {

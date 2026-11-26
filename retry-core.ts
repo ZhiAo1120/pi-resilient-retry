@@ -171,8 +171,9 @@ export function repairPayload(payload: unknown): { payload: unknown; removed: nu
 
 const LOG_LABELS = {
 	event: new Set(["session_start", "agent_before_settle", "retry_wait_start", "retry_cancelled", "retry_request",
-		"history_repaired", "retry_no_target", "retry_recovered"]),
-	decision: new Set(["retry", "skip: not an error outcome", "skip: run aborted", "skip: policy declined",
+		"history_repaired", "retry_no_target", "retry_recovered", "turn_limit_compaction"]),
+	decision: new Set(["retry", "compact: provider turn limit", "skip: turn-limit compaction already attempted", "started", "succeeded", "failed",
+		"skip: not an error outcome", "skip: run aborted", "skip: policy declined",
 		"skip: same error repeated", "skip: budget exhausted", "skip: disabled"]),
 	outcome: new Set(["completed", "error", "aborted"]),
 	stopReason: new Set(["stop", "length", "toolUse", "error", "aborted"]),
