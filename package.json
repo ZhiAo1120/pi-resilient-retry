@@ -1,6 +1,6 @@
 {
   "name": "pi-resilient-retry",
-  "version": "0.1.0",
+  "version": "0.1.3",
   "description": "Keep retrying failed provider requests that Pi's built-in retry gives up on",
   "keywords": [
     "pi-package",

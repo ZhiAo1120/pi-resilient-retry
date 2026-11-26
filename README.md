@@ -46,7 +46,7 @@ Use Pi's package manager so it loads the declared extension entry:
 pi install npm:pi-resilient-retry
 
 # Pin a particular release
-pi install npm:pi-resilient-retry@0.1.0
+pi install npm:pi-resilient-retry@0.1.3
 ```
 
 Requires Node.js 22.19+ and the compatible Pi extension API described above. Restart Pi or
@@ -64,7 +64,7 @@ pi update npm:pi-resilient-retry
 pi update --extensions
 ```
 
-Then restart or `/reload` once idle. A source pinned to `@0.1.0` stays on that version;
+Then restart or `/reload` once idle. A source pinned to `@0.1.3` stays on that version;
 install a newer explicit version to change the pin. A Git commit/push is not an npm release,
 and a Pi CLI upgrade does not automatically update this package.
 

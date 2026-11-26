@@ -43,7 +43,7 @@ npm 包：[`pi-resilient-retry`](https://www.npmjs.com/package/pi-resilient-retr
 pi install npm:pi-resilient-retry
 
 # 固定到指定版本
-pi install npm:pi-resilient-retry@0.1.0
+pi install npm:pi-resilient-retry@0.1.3
 ```
 
 需要 Node.js 22.19+ 及上文兼容的 Pi 扩展 API。重启 Pi，或在空闲时 `/reload`。
@@ -60,7 +60,7 @@ pi update npm:pi-resilient-retry
 pi update --extensions
 ```
 
-之后重启或在空闲时 `/reload`。固定到 `@0.1.0` 的来源仍停留在该版本，
+之后重启或在空闲时 `/reload`。固定到 `@0.1.3` 的来源仍停留在该版本，
 要升级固定版本请显式安装新版本号。Git commit / push 不等于 npm 发布，
 升级 Pi CLI 也不等于自动升级这个包。
 
